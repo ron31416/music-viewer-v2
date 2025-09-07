@@ -3,7 +3,7 @@ import type { Metadata } from 'next'
 import dynamic from 'next/dynamic'
 
 // If ScoreOSMD touches window/document (likely with OSMD), this avoids SSR crashes.
-const ScoreOSMD = dynamic(() => import('@/components/score.osmd'), { ssr: false })
+const ScoreOSMD = dynamic(() => import('@/components/scoreOSMD'), { ssr: false })
 
 export const metadata: Metadata = {
   title: 'Music Viewer v2',
