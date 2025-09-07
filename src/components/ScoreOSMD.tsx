@@ -1,4 +1,7 @@
 // filename: src/components/scoreOSMD.tsx
+
+'use client'
+
 import React, {
   useEffect,
   useMemo,
