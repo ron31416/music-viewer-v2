@@ -1,3 +1,4 @@
+// filename: src/components/scoreOSMD.tsx
 'use client'
 
 import React, {
@@ -22,6 +23,27 @@ export type ScoreOSMDProps = {
   style?: CSSProperties
 }
 
+/* Narrow interface for just what we use from OSMD */
+type OSMDIteratorLike = {
+  CurrentMeasureIndex: number
+}
+
+type OSMDCursorLike = {
+  show: () => void
+  hide?: () => void
+  next: () => void
+  previous: () => void
+  IteratorAtStart: () => boolean
+  IteratorAtEnd: () => boolean
+  iterator: OSMDIteratorLike
+  cursorElement?: HTMLElement
+}
+
+type OSMDEx = OpenSheetMusicDisplay & {
+  cursor?: OSMDCursorLike
+  clear?: () => void
+}
+
 export default function ScoreOSMD({
   src,
   zoom = 1,
@@ -30,7 +52,7 @@ export default function ScoreOSMD({
   style,
 }: ScoreOSMDProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const osmdRef = useRef<OpenSheetMusicDisplay | null>(null)
+  const osmdRef = useRef<OSMDEx | null>(null)
   const [ready, setReady] = useState(false)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -38,12 +60,11 @@ export default function ScoreOSMD({
 
   /** Stable cleanup */
   const dispose = useCallback(() => {
-    const osmd = osmdRef.current as any
+    const osmd = osmdRef.current
     if (osmd) {
       try {
         osmd.cursor?.hide?.()
       } catch {}
-      // If OSMD exposes clear(), call it; otherwise wipe the host node:
       osmd.clear?.()
     }
     if (hostRef.current) hostRef.current.innerHTML = ''
@@ -52,13 +73,13 @@ export default function ScoreOSMD({
 
   /** Stable scroll helper */
   const centerCursor = useCallback(() => {
-    const osmd = osmdRef.current as any
+    const osmd = osmdRef.current
     const el: HTMLElement | undefined = osmd?.cursor?.cursorElement
     if (el?.scrollIntoView) {
       el.scrollIntoView({
         block: 'center',
         inline: 'nearest',
-        behavior: 'auto', // 'instant' isn't standard; 'auto' = immediate
+        behavior: 'auto', // standard values: 'auto' | 'smooth'
       })
     }
   }, [])
@@ -73,11 +94,11 @@ export default function ScoreOSMD({
 
     const osmd = new OpenSheetMusicDisplay(node, {
       backend: 'svg',
-      autoResize: false, // we'll handle via ResizeObserver
+      autoResize: false, // handled via ResizeObserver below
       drawTitle: true,
       drawPartNames: true,
       drawingParameters: 'compact',
-    })
+    }) as OSMDEx
     osmdRef.current = osmd
 
     ;(async () => {
@@ -86,17 +107,16 @@ export default function ScoreOSMD({
       setReady(false)
       try {
         await osmd.load(src)
-        osmd.Zoom = zoomState
         await osmd.render()
         try {
-          osmd.cursor.show()
+          osmd.cursor?.show()
         } catch {}
         if (!cancelled) {
           setReady(true)
           centerCursor()
         }
-      } catch (e: any) {
-        if (!cancelled) setErr(e?.message ?? String(e))
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -106,7 +126,7 @@ export default function ScoreOSMD({
       cancelled = true
       dispose()
     }
-  }, [src, zoomState, dispose, centerCursor])
+  }, [src, dispose, centerCursor])
 
   /** If parent changes the `zoom` prop, adopt it */
   useEffect(() => setZoomState(zoom), [zoom])
@@ -120,7 +140,7 @@ export default function ScoreOSMD({
     centerCursor()
   }, [zoomState, centerCursor])
 
-  /** Observe host size; re-render and re-center */
+  /** Observe host size; re-render and re-center (debounced with rAF) */
   useEffect(() => {
     if (typeof ResizeObserver === 'undefined') return
     const host = hostRef.current
@@ -147,7 +167,7 @@ export default function ScoreOSMD({
 
   /** Measure-wise navigation */
   const prevMeasure = useCallback(() => {
-    const osmd = osmdRef.current as any
+    const osmd = osmdRef.current
     if (!osmd?.cursor) return
     try {
       if (!osmd.cursor.IteratorAtStart()) {
@@ -163,7 +183,7 @@ export default function ScoreOSMD({
   }, [centerCursor])
 
   const nextMeasure = useCallback(() => {
-    const osmd = osmdRef.current as any
+    const osmd = osmdRef.current
     if (!osmd?.cursor) return
     try {
       if (!osmd.cursor.IteratorAtEnd()) {
