@@ -3,7 +3,7 @@ import type { Metadata } from 'next'
 import dynamic from 'next/dynamic'
 
 // If ScoreOSMD touches window/document (likely with OSMD), this avoids SSR crashes.
-const OSMDViewer = dynamic(() => import('@/components/scoreOSMD'), { ssr: false })
+const ScoreOSMD = dynamic(() => import('@/components/ScoreOSMD'), { ssr: false })
 
 export const metadata: Metadata = {
   title: 'Music Viewer v2',
@@ -22,7 +22,7 @@ export default function Home() {
 
       <section className='mx-auto max-w-6xl p-4 md:p-6'>
         {/* If your ScoreOSMD component needs props (e.g., a URL), pass them here */}
-        <OSMDViewer src="/scores/gymnopedie-no-1-satie.mxl"/>
+        <ScoreOSMD src="/scores/gymnopedie-no-1-satie.mxl"/>
       </section>
     </main>
   )
