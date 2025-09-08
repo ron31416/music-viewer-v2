@@ -1,9 +1,10 @@
+// src/components/ScoreOSMD.tsx
 "use client";
 
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* --- minimal shapes (no any) --- */
+/* ---- minimal shapes (no any) ---- */
 interface SourceMeasure { MeasureNumber?: number }
 interface GraphicalMeasure {
   SourceMeasure?: SourceMeasure;
@@ -146,9 +147,10 @@ export default function ScoreOSMD({
   const nLinesRef = useRef(1);
   const currentRangeRef = useRef<{from:number; upTo:number}>({from:0, upTo:0});
   const recomputingRef = useRef(false);
+  const readyRef = useRef(false);               // <- new: block paging until model built
 
-  const FIT_PAD = 24;            // bigger safety pad
-  const VALIDATE_MAX = 5;        // more retries
+  const FIT_PAD = 24;
+  const VALIDATE_MAX = 5;
   const WHEEL_THROTTLE_MS = 160;
   const wheelLockRef = useRef(0);
 
@@ -166,7 +168,6 @@ export default function ScoreOSMD({
     const upTo = ends[endIdx];
     const from = s === 0 ? 1 : ends[s - 1] + 1;
 
-    // FIX: re-render when EITHER bound changes
     if (currentRangeRef.current.from !== from || currentRangeRef.current.upTo !== upTo) {
       setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
       osmd.render();
@@ -200,12 +201,12 @@ export default function ScoreOSMD({
     startSystemRef.current = s;
   }
 
-  function scheduleRecompute() {
+  function scheduleRecompute(immediate = false) {
     if (debounceRef.current) {
       window.clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
-    debounceRef.current = window.setTimeout(async () => {
+    const run = async () => {
       const container = boxRef.current;
       const osmd = osmdRef.current;
       if (!container || !osmd) return;
@@ -240,14 +241,19 @@ export default function ScoreOSMD({
         if (startSystemRef.current > lastStart) startSystemRef.current = lastStart;
 
         await renderPage(startSystemRef.current, n);
+        readyRef.current = true;            // <- model ready; enable paging
         purgeWebGL(container);
       } finally {
         recomputingRef.current = false;
       }
-    }, 100);
+    };
+
+    if (immediate) void run();
+    else debounceRef.current = window.setTimeout(() => { void run(); }, 80);
   }
 
   async function changePage(deltaPages:number) {
+    if (!readyRef.current) return;           // <- ignore until model built
     const total = systemEndsRef.current.length;
     const n = Math.max(1, nLinesRef.current);
     if (!total) return;
@@ -282,13 +288,13 @@ export default function ScoreOSMD({
 
     el.addEventListener("wheel", onWheel, { passive:false });
     window.addEventListener("keydown", onKey);
-    // focus once so keys work immediately
     el.tabIndex = 0; el.focus();
 
     return () => {
       el.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // mount / load
@@ -316,14 +322,16 @@ export default function ScoreOSMD({
       if (isPromise(maybe)) await maybe;
       osmd.render();
 
-      // initial compute/page
+      // initial compute/page (run immediately once)
       startSystemRef.current = 0;
       currentRangeRef.current = { from:0, upTo:0 };
-      scheduleRecompute();
+      readyRef.current = false;
+      scheduleRecompute(true);
 
+      // ← FIXED TYPO: attach the real observer
       if (!resizeObsRef.current) {
         resizeObsRef.current = new ResizeObserver(() => scheduleRecompute());
-        resizeObsRef?.current?.observe(boxRef.current!);
+        resizeObsRef.current.observe(boxRef.current);
       }
     })().catch(err => { console.error("OSMD init error:", err); });
 
