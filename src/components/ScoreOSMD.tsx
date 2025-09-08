@@ -4,7 +4,7 @@
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* --------- Minimal structural types (no `any`) --------- */
+/* --------- minimal structural types (no `any`) --------- */
 interface SourceMeasure { MeasureNumber?: number }
 interface GraphicalMeasure {
   SourceMeasure?: SourceMeasure;
@@ -30,25 +30,22 @@ type OSMDInstance = OpenSheetMusicDisplay & {
 };
 
 type Props = {
-  /** URL under /public, e.g. "/scores/gymnopedie-no-1-satie.mxl" */
-  src: string;
-  /** If true, container fills its parent (height:100%) */
-  fillParent?: boolean;
-  /** Fallback fixed height in px when not filling parent (default 600) */
-  height?: number;
-  /** Log measurements to console */
-  debug?: boolean;
+  src: string;                 // e.g. "/scores/gymnopedie-no-1-satie.mxl"
+  fillParent?: boolean;        // height:100% if true
+  height?: number;             // px when not filling parent (default 600)
+  debug?: boolean;             // console tables
   className?: string;
   style?: React.CSSProperties;
 };
 
-/* Helpers */
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
 function afterPaint(): Promise<void> {
   return new Promise(res => requestAnimationFrame(() => requestAnimationFrame(() => res())));
 }
+
+/* belt-and-suspenders: nuke any WebGL contexts that might appear */
 function purgeWebGL(node: HTMLElement) {
   const canvases = Array.from(node.querySelectorAll("canvas"));
   for (const c of canvases) {
@@ -63,7 +60,7 @@ function purgeWebGL(node: HTMLElement) {
   }
 }
 
-/* Measure systems (“bands”) from rendered SVG */
+/* ---- DOM measurement of systems (“bands”) ---- */
 type Band = { top: number; bottom: number; height: number };
 function analyzeBands(container: HTMLDivElement): Band[] {
   const svg = container.querySelector("svg");
@@ -92,7 +89,7 @@ function analyzeBands(container: HTMLDivElement): Band[] {
 
   boxes.sort((a, b) => a.y - b.y);
 
-  const GAP = 24;
+  const GAP = 24; // px between systems
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -107,7 +104,7 @@ function analyzeBands(container: HTMLDivElement): Band[] {
   return bands;
 }
 
-/* Choose how many systems fit fully by bottom edge */
+/* how many systems fit fully (by bottom edge) */
 function linesPerPage(bands: Band[], container: HTMLDivElement, padPx: number): number {
   const limit = container.clientHeight - padPx;
   let count = 0;
@@ -115,33 +112,37 @@ function linesPerPage(bands: Band[], container: HTMLDivElement, padPx: number): 
     if (b.bottom <= limit) count += 1;
     else break;
   }
-  return Math.max(1, count); // always show at least one line
+  return Math.max(1, count);
 }
 
-/* Map system index → last measure number */
-function lastMeasureOfSystem(osmd: OSMDInstance, systemIndex: number): number {
+/* ------------ FULL-LAYOUT mapping: system index -> last measure number (for ALL pages) ----------- */
+function buildSystemMeasureEnds(osmd: OSMDInstance): number[] {
+  const ends: number[] = [];
   const gms = osmd.GraphicalMusicSheet;
-  const page0: MusicPage | undefined = gms?.MusicPages?.[0];
-  const sys: MusicSystem | undefined = page0?.MusicSystems?.[systemIndex];
-  if (!sys) return 0;
-
-  const lines: StaffLine[] = (sys.StaffLines ?? sys.staffLines) ?? [];
-  let best = 0;
-  for (const sl of lines) {
-    const measures: GraphicalMeasure[] = (sl.Measures ?? sl.measures) ?? [];
-    for (const m of measures) {
-      const n =
-        m.SourceMeasure?.MeasureNumber ??
-        m.ParentMeasure?.SourceMeasure?.MeasureNumber ??
-        m.Parent?.SourceMeasure?.MeasureNumber ??
-        m.MeasureNumber ?? 0;
-      if (n > best) best = n;
+  const pages: MusicPage[] = gms?.MusicPages ?? [];
+  for (const page of pages) {
+    const systems: MusicSystem[] = page.MusicSystems ?? [];
+    for (const sys of systems) {
+      const lines: StaffLine[] = (sys.StaffLines ?? sys.staffLines) ?? [];
+      let best = 0;
+      for (const sl of lines) {
+        const measures: GraphicalMeasure[] = (sl.Measures ?? sl.measures) ?? [];
+        for (const m of measures) {
+          const n =
+            m.SourceMeasure?.MeasureNumber ??
+            m.ParentMeasure?.SourceMeasure?.MeasureNumber ??
+            m.Parent?.SourceMeasure?.MeasureNumber ??
+            m.MeasureNumber ?? 0;
+          if (n > best) best = n;
+        }
+      }
+      if (best > 0) ends.push(best);
     }
   }
-  return best;
+  return ends;
 }
 
-/* Narrow options type for setOptions */
+/* narrow options type for setOptions */
 type MeasureSliceOptions = { drawFromMeasureNumber?: number; drawUpToMeasureNumber?: number; };
 function setMeasureOptions(osmd: OSMDInstance, opts: MeasureSliceOptions) {
   (osmd as unknown as { setOptions: (o: MeasureSliceOptions) => void }).setOptions(opts);
@@ -161,68 +162,70 @@ export default function ScoreOSMD({
   const resizeObsRef = useRef<ResizeObserver | null>(null);
   const debounceTimer = useRef<number | null>(null);
 
-  // Paging state (by system index)
+  // Paging state & cached mapping
   const startSystemRef = useRef<number>(0);
   const linesPerPageRef = useRef<number>(1);
-  const totalSystemsRef = useRef<number>(0);
-  const currentUpToRef = useRef<number>(0);
+  const systemEndsRef = useRef<number[]>([]); // system k -> last measure number
+  const currentRangeRef = useRef<{ from: number; upTo: number }>({ from: 0, upTo: 0 });
   const recomputingRef = useRef<boolean>(false);
 
-  const FIT_PAD_PX = 16;           // prevents “peek” at bottom
-  const VALIDATE_MAX_STEPS = 3;    // post-slice validation cap
+  const FIT_PAD_PX = 16;
+  const VALIDATE_MAX_STEPS = 3;
+  const WHEEL_COOLDOWN_MS = 180;
+  const wheelLockRef = useRef<number>(0);
 
-  /** Render a specific “page” starting at system index s for n lines */
-  const renderPage = async (s: number, n: number) => {
+  /* render a page: systems [start .. start + n - 1], using PRECOMPUTED systemEndsRef */
+  const renderPage = async (start: number, n: number) => {
     const container = boxRef.current;
     const osmd = osmdRef.current;
-    if (!container || !osmd) return;
+    const ends = systemEndsRef.current;
+    if (!container || !osmd || ends.length === 0) return;
 
-    // Boundaries
-    const lastStart = Math.max(0, totalSystemsRef.current - n);
-    const start = Math.min(Math.max(0, s), Math.max(0, lastStart));
-    const endSystemIndex = Math.min(totalSystemsRef.current - 1, start + n - 1);
+    const totalSystems = ends.length;
+    const lastStart = Math.max(0, totalSystems - n);
+    const s = Math.min(Math.max(0, start), lastStart);
+    const endIndex = Math.min(totalSystems - 1, s + n - 1);
 
-    // Compute measure range
-    const upTo = lastMeasureOfSystem(osmd, endSystemIndex);
-    const from = start === 0 ? 1 : lastMeasureOfSystem(osmd, start - 1) + 1;
+    const upTo = ends[endIndex];
+    const from = s === 0 ? 1 : ends[s - 1] + 1;
 
-    // Apply slice only if changed
-    if (upTo !== currentUpToRef.current || from === 1 && start !== 0) {
+    // Only re-render if the measure range actually changes
+    if (currentRangeRef.current.from !== from || currentRangeRef.current.upTo !== upTo) {
       setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
       osmd.render();
-      currentUpToRef.current = upTo;
-      startSystemRef.current = start;
+      currentRangeRef.current = { from, upTo };
       await afterPaint();
     }
 
-    // Post-slice validate: if end still peeks, drop one system and retry (few times)
+    // Post-slice validation: drop one system if the last still “peeks”
     let steps = 0;
     while (steps < VALIDATE_MAX_STEPS) {
       const bands = analyzeBands(container);
       const limit = container.clientHeight - FIT_PAD_PX;
       const lastBand = bands[bands.length - 1];
-      if (!lastBand) break;
-      if (lastBand.bottom <= limit) break;
+      if (!lastBand || lastBand.bottom <= limit) break;
 
-      // drop one system (but keep at least 1)
-      if (n <= 1) break;
+      if (n <= 1) break; // cannot shrink further
       n -= 1;
-      const newEndSys = Math.min(totalSystemsRef.current - 1, start + n - 1);
-      const newUpTo = lastMeasureOfSystem(osmd, newEndSys);
-      if (newUpTo === currentUpToRef.current) break;
 
-      setMeasureOptions(osmd, {
-        drawFromMeasureNumber: start === 0 ? 1 : lastMeasureOfSystem(osmd, start - 1) + 1,
-        drawUpToMeasureNumber: newUpTo,
-      });
+      const newEndIdx = Math.min(totalSystems - 1, s + n - 1);
+      const newUpTo = ends[newEndIdx];
+      const newFrom = s === 0 ? 1 : ends[s - 1] + 1;
+
+      if (currentRangeRef.current.from === newFrom && currentRangeRef.current.upTo === newUpTo) break;
+
+      setMeasureOptions(osmd, { drawFromMeasureNumber: newFrom, drawUpToMeasureNumber: newUpTo });
       osmd.render();
-      currentUpToRef.current = newUpTo;
+      currentRangeRef.current = { from: newFrom, upTo: newUpTo };
       await afterPaint();
+
       steps += 1;
     }
+
+    startSystemRef.current = s;
   };
 
-  /** Recompute layout: measure full, decide n lines per page, render current page */
+  /* Full recompute on size change: full render → build mapping → measure -> decide N -> render page */
   const scheduleRecompute = () => {
     if (debounceTimer.current) {
       window.clearTimeout(debounceTimer.current);
@@ -238,15 +241,16 @@ export default function ScoreOSMD({
       try {
         purgeWebGL(container);
 
-        // Full render
+        // 1) FULL render (clear any previous slice)
         setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: Number.MAX_SAFE_INTEGER });
         osmd.render();
         await afterPaint();
 
-        // Measure systems & decide lines per page
-        const bands = analyzeBands(container);
-        totalSystemsRef.current = bands.length;
+        // 2) Build a STABLE system→lastMeasure mapping for the entire score
+        systemEndsRef.current = buildSystemMeasureEnds(osmd);
 
+        // 3) DOM-measure page to decide how many lines fit
+        const bands = analyzeBands(container);
         const n = linesPerPage(bands, container, FIT_PAD_PX);
         linesPerPageRef.current = n;
 
@@ -256,25 +260,26 @@ export default function ScoreOSMD({
             line: i + 1, top: b.top.toFixed(1), bottom: b.bottom.toFixed(1), height: b.height.toFixed(1),
           })));
           // eslint-disable-next-line no-console
-          console.log(`linesPerPage = ${n}, totalSystems = ${bands.length}, startSystem = ${startSystemRef.current}`);
+          console.log(`linesPerPage = ${n}, totalSystems = ${systemEndsRef.current.length}, startSystem = ${startSystemRef.current}`);
         }
 
-        // Ensure current start index is valid under new n/total
-        const lastStart = Math.max(0, bands.length - n);
+        // 4) Clamp current start index under new totals
+        const total = systemEndsRef.current.length;
+        const lastStart = Math.max(0, total - n);
         if (startSystemRef.current > lastStart) startSystemRef.current = lastStart;
 
+        // 5) Render that page
         await renderPage(startSystemRef.current, n);
-        purgeWebGL(container);
       } finally {
         recomputingRef.current = false;
       }
     }, 120);
   };
 
-  /** Page forward/back by a full set of lines */
+  /* Page forward/back by a full set of lines */
   const changePage = async (deltaPages: number) => {
+    const total = systemEndsRef.current.length;
     const n = Math.max(1, linesPerPageRef.current);
-    const total = totalSystemsRef.current;
     if (!total) return;
 
     const lastStart = Math.max(0, total - n);
@@ -296,16 +301,21 @@ export default function ScoreOSMD({
       // Only vertical intent
       if (Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
       e.preventDefault();
-      changePage(e.deltaY > 0 ? 1 : -1);
+
+      const now = Date.now();
+      if (now < wheelLockRef.current) return; // throttle bursts
+      wheelLockRef.current = now + WHEEL_COOLDOWN_MS;
+
+      void changePage(e.deltaY > 0 ? 1 : -1);
     };
 
     const onKey = (e: KeyboardEvent) => {
       if (["PageDown", "ArrowDown", " "].includes(e.key)) {
         e.preventDefault();
-        changePage(1);
+        void changePage(1);
       } else if (["PageUp", "ArrowUp"].includes(e.key)) {
         e.preventDefault();
-        changePage(-1);
+        void changePage(-1);
       }
     };
 
@@ -333,7 +343,7 @@ export default function ScoreOSMD({
       }
 
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
-        backend: "svg" as const,
+        backend: "svg" as const, // force SVG backend
         autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
@@ -345,8 +355,8 @@ export default function ScoreOSMD({
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
       osmd.render();
-      currentUpToRef.current = 0;
       startSystemRef.current = 0;
+      currentRangeRef.current = { from: 0, upTo: 0 };
 
       // Initial compute/page
       scheduleRecompute();
@@ -378,7 +388,7 @@ export default function ScoreOSMD({
     };
   }, [src]);
 
-  // Container sizing: note `overflowY: hidden` → no vertical scrollbar
+  // Container: NO vertical scrollbar (we page instead of scrolling)
   const containerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, overflowY: "hidden", overflowX: "hidden" }
     : { width: "100%", height, minHeight: height, overflowY: "hidden", overflowX: "hidden" };
@@ -388,7 +398,7 @@ export default function ScoreOSMD({
       ref={boxRef}
       className={`osmd-container ${className || ""}`}
       style={{ background: "#fff", ...containerStyle, ...style }}
-      tabIndex={0} // so the container can receive keyboard focus if needed
+      tabIndex={0}
     />
   );
 }
