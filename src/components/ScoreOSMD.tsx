@@ -119,8 +119,8 @@ export default function ScoreOSMD({
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // Tunables
-  const TOP_PAD_MAX = 8; // max cushion at the top (px)
-  const FIT_PAD = 22;    // bottom safety (px)
+  const TOP_PAD_MAX = 8;  // px
+  const FIT_PAD     = 22; // px
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -132,7 +132,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  // Apply translation AND update bottom mask; dynamic top pad prevents truncation at threshold
+  // Translate + mask, with post-adjust to guarantee no truncation
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -151,31 +151,50 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const lastBottom = bands[lastIdx]?.bottom ?? startTop;
 
-    // ---- dynamic top pad ----
     const containerH = outer.clientHeight;
-    const limit = containerH - FIT_PAD; // bottom edge we must not cross
-    const needed = lastBottom - startTop; // height of the visible lines (no pad)
-    // room left for top pad without pushing bottom below limit
-    const slack = Math.max(0, limit - needed);
-    const pad = Math.min(TOP_PAD_MAX, slack); // shrink pad when space is tight
+    const limit = containerH - FIT_PAD;
+    const needed = lastBottom - startTop;
 
-    // Snap upward with dynamic pad
-    const ySnap = Math.ceil(startTop - pad);
+    // initial dynamic pad (don’t push beyond limit)
+    const slack = Math.max(0, limit - needed);
+    let pad = Math.min(TOP_PAD_MAX, slack);
+
+    // snap & apply
+    let ySnap = Math.round(startTop - pad);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Bottom mask just below the last fully visible system
-    const visibleBottom = (lastBottom - startTop) + pad;
-    const maskTop = Math.max(0, Math.ceil(visibleBottom));
+    // ---------- post-adjust pass ----------
+    // Compute where the last line would land relative to the viewport
+    let lastVisible = needed + pad; // bottom minus aligned top (with pad)
+    const over = lastVisible - limit;
+    if (over > 0) {
+      // Reduce pad just enough to fit
+      pad = Math.max(0, pad - over);
+      ySnap = Math.round(startTop - pad);
+      svg.style.transform = `translateY(${-ySnap}px)`;
+      lastVisible = needed + pad; // recompute (now <= limit)
+    }
+    // --------------------------------------
+
+    // Bottom mask just below last fully visible system
+    let maskTop = Math.floor(lastVisible);
+    if (maskTop > containerH - 1) maskTop = containerH - 1; // clamp for safety
+    if (maskTop < 0) maskTop = 0;
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
     }
 
-    updateHUD();
-  }, [FIT_PAD, TOP_PAD_MAX, updateHUD]);
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log({ startIdx, lastIdx, startTop, lastBottom, needed, pad, limit, ySnap, maskTop });
+    }
 
-  // Recompute bands + how many fit (conservative: assumes we might need full TOP_PAD_MAX)
+    updateHUD();
+  }, [FIT_PAD, TOP_PAD_MAX, updateHUD, debug]);
+
+  // Recompute (conservative per-page count, then translate with dynamic pad)
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -183,7 +202,6 @@ export default function ScoreOSMD({
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    // Conservative per-page count (reserve full top pad so we never overcount)
     const available = Math.max(0, outer.clientHeight - FIT_PAD - TOP_PAD_MAX);
     let n = 0;
     for (const b of bands) {
