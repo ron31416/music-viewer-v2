@@ -16,7 +16,7 @@ function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
 
-/** Cluster <g> boxes vertically; compute band features for filtering. */
+/** Analyze vertical bands from rendered SVG, with system-like features. */
 function analyzeBands(container: HTMLDivElement) {
   const svg = container.querySelector("svg");
   if (!svg) return { bands: [] as Band[], svgWidth: 0 };
@@ -43,74 +43,59 @@ function analyzeBands(container: HTMLDivElement) {
       } catch { /* ignore */ }
     }
   }
-  if (!boxes.length) return { bands: [] as Band[], svgWidth: (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width) || svg.clientWidth || 0 };
 
-  boxes.sort((a, b) => a.y - b.y);
-
-  const GAP = 24; // px
-  const rawBands: { top: number; bottom: number; members: Box[] }[] = [];
+  boxes.sort((a,b)=>a.y-b.y);
+  const GAP = 24;
+  const raw: { top:number; bottom:number; members:Box[] }[] = [];
   for (const b of boxes) {
-    const last = rawBands[rawBands.length - 1];
-    if (!last || b.y - last.bottom > GAP) {
-      rawBands.push({ top: b.y, bottom: b.bottom, members: [b] });
-    } else {
+    const last = raw[raw.length-1];
+    if (!last || b.y - last.bottom > GAP) raw.push({ top:b.y, bottom:b.bottom, members:[b] });
+    else {
       if (b.y < last.top) last.top = b.y;
       if (b.bottom > last.bottom) last.bottom = b.bottom;
       last.members.push(b);
     }
   }
 
-  // Feature: count tall vertical lines in each band (barlines/brackets are strong “system” signals)
   function countVerticals(members: Box[]) {
     let count = 0;
     for (const m of members) {
       const lines = Array.from(m.el.querySelectorAll<SVGLineElement>("line"));
       for (const ln of lines) {
-        const x1 = Number(ln.getAttribute("x1") || "0");
-        const x2 = Number(ln.getAttribute("x2") || "0");
-        const y1 = Number(ln.getAttribute("y1") || "0");
-        const y2 = Number(ln.getAttribute("y2") || "0");
-        const dx = Math.abs(x1 - x2);
-        const dy = Math.abs(y1 - y2);
-        if (dx <= 1 && dy > 30) count++; // thin & tall
+        const x1 = +((ln.getAttribute("x1")||"0")); const x2 = +((ln.getAttribute("x2")||"0"));
+        const y1 = +((ln.getAttribute("y1")||"0")); const y2 = +((ln.getAttribute("y2")||"0"));
+        if (Math.abs(x1-x2) <= 1 && Math.abs(y1-y2) > 30) count++;
       }
-      // Some editions draw barlines as skinny rects/paths; approximate via bbox ratio
-      const paths = Array.from(m.el.querySelectorAll<SVGGraphicsElement>("path,rect"));
-      for (const p of paths) {
-        try {
-          const bb = p.getBBox();
-          if (bb.width <= 2 && bb.height > 30) count++;
-        } catch { /* ignore */ }
+      const rects = Array.from(m.el.querySelectorAll<SVGGraphicsElement>("path,rect"));
+      for (const r of rects) {
+        try { const bb = r.getBBox(); if (bb.width <= 2 && bb.height > 30) count++; } catch {}
       }
     }
     return count;
   }
 
-  const bands: Band[] = rawBands.map(b => {
-    const maxWidth = Math.max(...b.members.map(m => m.width));
-    return { top: b.top, bottom: b.bottom, height: b.bottom - b.top, maxWidth, verticalLines: countVerticals(b.members) };
+  const bands = raw.map(b=>{
+    const maxWidth = Math.max(...b.members.map(m=>m.width));
+    return { top:b.top, bottom:b.bottom, height:b.bottom-b.top, maxWidth, verticalLines: countVerticals(b.members) };
   });
 
   const svgWidth = (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width) || svg.clientWidth || 0;
   return { bands, svgWidth };
 }
 
-/** Drop the top header/title band using stronger heuristics. */
+/** Drop header/title band with stronger heuristic. */
 function dropHeaderIfPresent(bands: ReturnType<typeof analyzeBands>["bands"], svgWidth: number) {
   if (bands.length < 2) return bands;
   const [first, second] = bands;
 
-  // Median height among all bands (excluding the first for robustness)
-  const restHeights = bands.slice(1).map(b => b.height).sort((a, b) => a - b);
-  const median = restHeights.length
-    ? restHeights[Math.floor(restHeights.length / 2)]
-    : second.height;
+  const restHeights = bands.slice(1).map(b => b.height).sort((a,b)=>a-b);
+  const median = restHeights.length ? restHeights[Math.floor(restHeights.length/2)] : second.height;
+  const widthCov = svgWidth ? first.maxWidth / svgWidth : 1;
 
-  const widthCov = svgWidth ? first.maxWidth / svgWidth : 1; // 0..1
   const looksLikeHeader =
-    first.verticalLines <= 1 &&                              // little to no barlines
-    (first.height > median * 1.3 || first.height > 80) &&   // unusually tall
-    widthCov < 0.9;                                         // usually not full width
+    first.verticalLines <= 1 &&
+    (first.height > median * 1.3 || first.height > 80) &&
+    widthCov < 0.9;
 
   return looksLikeHeader ? bands.slice(1) : bands;
 }
@@ -119,44 +104,41 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
   const boxRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDInstance | null>(null);
 
-  const lastWidthRef = useRef<number | null>(null);
-  const debounceTimer = useRef<number | null>(null);
-  const resizeObsRef = useRef<ResizeObserver | null>(null);
   const lastSigRef = useRef<string>("");
+  const moRef = useRef<MutationObserver | null>(null);
+  const debounceTimer = useRef<number | null>(null);
 
-  const logOnce = () => {
-    if (!boxRef.current) return;
-    const { bands, svgWidth } = analyzeBands(boxRef.current);
-    const systems = dropHeaderIfPresent(bands, svgWidth);
-
-    const sig = `${lastWidthRef.current}|${systems.length}|${systems.map(s => s.height.toFixed(1)).join(",")}`;
-    if (sig === lastSigRef.current) return; // dedupe identical results
-    lastSigRef.current = sig;
-
-    if (!systems.length) {
-      console.warn("No systems detected during measurement.");
-      return;
-    }
-    // Force a fresh array literal so DevTools renders a table reliably
-    console.table(
-      systems.map((s, i) => ({
-        line: i + 1,
-        top: s.top.toFixed(1),
-        bottom: s.bottom.toFixed(1),
-        height: s.height.toFixed(1),
-      }))
-    );
-    const tallest = systems.reduce((a, b) => (b.height > a.height ? b : a), systems[0]);
-    console.log(`Tallest line → line ${systems.indexOf(tallest) + 1}, height ${tallest.height.toFixed(1)} px`);
-  };
-
-  const scheduleLog = () => {
+  // debounced measurement triggered by DOM mutations (OSMD reflow)
+  const scheduleMeasure = () => {
     if (debounceTimer.current) {
       window.clearTimeout(debounceTimer.current);
       debounceTimer.current = null;
     }
-    // Debounce bursty resize/reflow events
-    debounceTimer.current = window.setTimeout(logOnce, 120);
+    debounceTimer.current = window.setTimeout(() => {
+      if (!boxRef.current) return;
+      const { bands, svgWidth } = analyzeBands(boxRef.current);
+      const systems = dropHeaderIfPresent(bands, svgWidth);
+
+      // dedupe identical output
+      const sig = `${systems.length}|${systems.map(s=>s.height.toFixed(1)).join(",")}`;
+      if (sig === lastSigRef.current) return;
+      lastSigRef.current = sig;
+
+      if (!systems.length) {
+        console.warn("No systems detected during measurement.");
+        return;
+      }
+      console.table(
+        systems.map((s,i)=>({
+          line: i+1,
+          top: s.top.toFixed(1),
+          bottom: s.bottom.toFixed(1),
+          height: s.height.toFixed(1)
+        }))
+      );
+      const tallest = systems.reduce((a,b)=> b.height>a.height ? b : a, systems[0]);
+      console.log(`Tallest line → line ${systems.indexOf(tallest)+1}, height ${tallest.height.toFixed(1)} px`);
+    }, 120); // small debounce so we run after OSMD finishes DOM updates
   };
 
   useEffect(() => {
@@ -164,12 +146,13 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       if (!boxRef.current) return;
 
       boxRef.current.style.background = "#fff";
-      await new Promise<void>(r => requestAnimationFrame(() => r()));
-      await new Promise<void>(r => requestAnimationFrame(() => r()));
+      await new Promise<void>(r => requestAnimationFrame(()=>r()));
+      await new Promise<void>(r => requestAnimationFrame(()=>r()));
 
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
+      // cleanup previous
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -177,7 +160,7 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       }
 
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
-        autoResize: true,
+        autoResize: true, // OSMD reflows on width changes
         drawTitle: true,
         drawSubtitle: true,
         drawComposer: true,
@@ -189,20 +172,23 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       if (isPromise(maybe)) await maybe;
       osmd.render();
 
-      // Initial measure (debounced to allow any immediate auto-resize)
-      scheduleLog();
-
-      // Observe width changes
-      if (!resizeObsRef.current) {
-        resizeObsRef.current = new ResizeObserver(entries => {
-          const w = Math.round(entries[0]?.contentRect?.width ?? 0);
-          if (w && w !== lastWidthRef.current) {
-            lastWidthRef.current = w;
-            scheduleLog();
-          }
+      // Observe the SVG subtree for **actual DOM changes** (child/attr/text)
+      if (!moRef.current) {
+        moRef.current = new MutationObserver(() => {
+          // Any DOM change in the SVG subtree will land here; measure once debounced
+          scheduleMeasure();
         });
-        resizeObsRef.current.observe(boxRef.current);
       }
+      // Attach observer to container (subtree: true so it catches SVG replacements)
+      moRef.current.observe(boxRef.current, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: false
+      });
+
+      // Kick an initial measurement after first paint
+      scheduleMeasure();
     })().catch(err => {
       console.error("OSMD load/render error:", err);
     });
@@ -212,10 +198,10 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
         window.clearTimeout(debounceTimer.current);
         debounceTimer.current = null;
       }
-      if (resizeObsRef.current && boxRef.current) {
-        resizeObsRef.current.unobserve(boxRef.current);
+      if (moRef.current) {
+        moRef.current.disconnect();
+        moRef.current = null;
       }
-      resizeObsRef.current = null;
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
