@@ -119,9 +119,8 @@ export default function ScoreOSMD({
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // Tunables
-  const TOP_PAD_MAX = 8;  // px
-  const FIT_PAD     = 22; // px
-  const WHEEL_THROTTLE_MS = 140;
+  const FIT_PAD = 22;            // bottom safety (px)
+  const WHEEL_THROTTLE_MS = 140; // wheel rate limit
   const wheelLockRef = useRef<number>(0);
 
   const updateHUD = useCallback(() => {
@@ -132,7 +131,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  // Translate + mask, with post-adjust to guarantee no truncation
+  // Translate + mask (no top padding; mask starts at NEXT system's top)
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -149,38 +148,19 @@ export default function ScoreOSMD({
     const startIdx = pageIdx * perPage;
     const startTop = bands[startIdx]?.top ?? 0;
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
-    const lastBottom = bands[lastIdx]?.bottom ?? startTop;
+    const nextIdx = lastIdx + 1;
 
-    const containerH = outer.clientHeight;
-    const limit = containerH - FIT_PAD;
-    const needed = lastBottom - startTop;
-
-    // initial dynamic pad (don’t push beyond limit)
-    const slack = Math.max(0, limit - needed);
-    let pad = Math.min(TOP_PAD_MAX, slack);
-
-    // snap & apply
-    let ySnap = Math.round(startTop - pad);
+    // align exactly to the top of the first visible system
+    const ySnap = Math.round(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // ---------- post-adjust pass ----------
-    // Compute where the last line would land relative to the viewport
-    let lastVisible = needed + pad; // bottom minus aligned top (with pad)
-    const over = lastVisible - limit;
-    if (over > 0) {
-      // Reduce pad just enough to fit
-      pad = Math.max(0, pad - over);
-      ySnap = Math.round(startTop - pad);
-      svg.style.transform = `translateY(${-ySnap}px)`;
-      lastVisible = needed + pad; // recompute (now <= limit)
+    // bottom mask begins at NEXT system's top (so we never clip the current last full line)
+    let maskTop = outer.clientHeight; // default: hide nothing extra
+    if (nextIdx < bands.length) {
+      const nextTopRel = bands[nextIdx].top - startTop;
+      maskTop = Math.min(outer.clientHeight - 1, Math.max(0, Math.ceil(nextTopRel)));
     }
-    // --------------------------------------
-
-    // Bottom mask just below last fully visible system
-    let maskTop = Math.floor(lastVisible);
-    if (maskTop > containerH - 1) maskTop = containerH - 1; // clamp for safety
-    if (maskTop < 0) maskTop = 0;
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
@@ -188,13 +168,13 @@ export default function ScoreOSMD({
 
     if (debug) {
       // eslint-disable-next-line no-console
-      console.log({ startIdx, lastIdx, startTop, lastBottom, needed, pad, limit, ySnap, maskTop });
+      console.log({ pageIdx, perPage, startIdx, lastIdx, nextIdx, startTop, ySnap, maskTop });
     }
 
     updateHUD();
-  }, [FIT_PAD, TOP_PAD_MAX, updateHUD, debug]);
+  }, [updateHUD, debug]);
 
-  // Recompute (conservative per-page count, then translate with dynamic pad)
+  // Recompute bands and per-page count (no top pad involved)
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -202,7 +182,7 @@ export default function ScoreOSMD({
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    const available = Math.max(0, outer.clientHeight - FIT_PAD - TOP_PAD_MAX);
+    const available = Math.max(0, outer.clientHeight - FIT_PAD);
     let n = 0;
     for (const b of bands) {
       if (b.bottom - bands[0].top <= available) n += 1;
@@ -221,7 +201,7 @@ export default function ScoreOSMD({
     if (pageRef.current > maxPageIdx) pageRef.current = maxPageIdx;
 
     applyTranslateForPage(pageRef.current);
-  }, [FIT_PAD, TOP_PAD_MAX, applyTranslateForPage, debug]);
+  }, [FIT_PAD, applyTranslateForPage, debug]);
 
   const nextPage = useCallback((deltaPages: number) => {
     if (!readyRef.current) return;
