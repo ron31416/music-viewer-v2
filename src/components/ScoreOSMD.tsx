@@ -1,9 +1,9 @@
-// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
+/* Props */
 type Props = {
   src: string;
   fillParent?: boolean;
@@ -14,6 +14,7 @@ type Props = {
   style?: React.CSSProperties;
 };
 
+/* Small helpers */
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as { then?: unknown });
 }
@@ -35,6 +36,7 @@ function purgeWebGL(node: HTMLElement): void {
   }
 }
 
+/* Band = one system line in CSS px, relative to wrapper top */
 type Band = { top: number; bottom: number; height: number };
 
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
@@ -54,7 +56,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
       try {
         const r = g.getBoundingClientRect();
         if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-        if (r.height < 8 || r.width < 40) continue;
+        if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
         boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
       } catch {}
     }
@@ -62,7 +64,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
 
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px
+  const GAP = 18; // px between systems
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -77,13 +79,11 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   return bands;
 }
 
+/* SVG + transform helpers */
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg") as SVGSVGElement | null;
 }
-function withUntransformedSvg<T>(
-  outer: HTMLDivElement,
-  fn: (svg: SVGSVGElement) => T
-): T | null {
+function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
   const svg = getSvg(outer);
   if (!svg) return null;
   const prev = svg.style.transform;
@@ -94,9 +94,18 @@ function withUntransformedSvg<T>(
     svg.style.transform = prev;
   }
 }
+function getCurrentTranslateY(outer: HTMLDivElement): number {
+  const svg = getSvg(outer);
+  if (!svg) return 0;
+  // expect "translateY(-123px)" or empty
+  const m = /translateY\((-?\d+\.?\d*)px\)/.exec(svg.style.transform || "");
+  return m ? parseFloat(m[1]) : 0;
+}
 
+/* OSMD type */
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
+/* Component */
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -120,20 +129,20 @@ export default function ScoreOSMD({
 
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
-  // Tunables
-  const FIT_PAD = 22;               // bottom safety (px)
-  const WHEEL_THROTTLE_MS = 140;    // wheel rate limit
+  /* Tunables */
+  const MASK_OVERLAP = 3;          // px: hide a hair *above* next system top to prevent slur peeking
+  const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
-  // --- RAF debounce for resize measurements ---
-  const rafTicket1 = useRef<number | null>(null);
-  const rafTicket2 = useRef<number | null>(null);
+  /* Debounced resize recompute (wait for OSMD auto-resize to settle) */
+  const raf1 = useRef<number | null>(null);
+  const raf2 = useRef<number | null>(null);
   const scheduleRecompute = useCallback(() => {
-    if (rafTicket1.current != null) cancelAnimationFrame(rafTicket1.current);
-    if (rafTicket2.current != null) cancelAnimationFrame(rafTicket2.current);
-    rafTicket1.current = requestAnimationFrame(() => {
-      rafTicket2.current = requestAnimationFrame(() => {
-        recomputeLayoutAndPage(); // after two RAFs → OSMD auto layout has settled
+    if (raf1.current != null) cancelAnimationFrame(raf1.current);
+    if (raf2.current != null) cancelAnimationFrame(raf2.current);
+    raf1.current = requestAnimationFrame(() => {
+      raf2.current = requestAnimationFrame(() => {
+        recomputeLayoutAndPage(true); // keep position across reflow
       });
     });
   }, []);
@@ -146,7 +155,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  // Translate + mask (no top padding). Mask starts at NEXT system's top.
+  /* Apply translation + bottom mask (no top padding) */
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -165,16 +174,19 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    // Ceil so we never leave a top gap due to fractional px
+    // Align so that first visible system’s top sits at viewport top (no rounding down)
     const ySnap = Math.ceil(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Bottom mask begins at NEXT system's top (relative to aligned top)
-    let maskTop = outer.clientHeight; // default (no mask)
+    // Bottom mask hides anything starting from NEXT system’s top (minus a tiny overlap)
+    let maskTop = outer.clientHeight; // default (no extra mask)
     if (nextIdx < bands.length) {
       const nextTopRel = bands[nextIdx].top - startTop;
-      maskTop = Math.min(outer.clientHeight - 1, Math.max(0, Math.ceil(nextTopRel)));
+      maskTop = Math.min(
+        outer.clientHeight - 1,
+        Math.max(0, Math.ceil(nextTopRel - MASK_OVERLAP))
+      );
     }
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
@@ -187,23 +199,38 @@ export default function ScoreOSMD({
     }
 
     updateHUD();
-  }, [updateHUD, debug]);
+  }, [MASK_OVERLAP, updateHUD, debug]);
 
-  // Recompute bands and per-page count
-  const recomputeLayoutAndPage = useCallback(() => {
+  /* Recompute bands + per-page. Optionally keep musical position across reflow. */
+  const recomputeLayoutAndPage = useCallback((keepPosition = false) => {
     const outer = wrapRef.current;
     if (!outer) return;
+
+    // capture current aligned Y (relative to wrapper) so we can keep position
+    const prevTranslate = keepPosition ? getCurrentTranslateY(outer) : 0;
+    const prevAlignedTop = keepPosition ? Math.max(0, -prevTranslate) : 0;
 
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    const available = Math.max(0, outer.clientHeight - FIT_PAD);
+    // how many systems fit? (we rely on mask for the next line, so no explicit bottom pad)
+    const limit = outer.clientHeight;
     let n = 0;
     for (const b of bands) {
-      if (b.bottom - bands[0].top <= available) n += 1;
+      if (b.bottom - (bands[0]?.top ?? 0) <= limit) n += 1;
       else break;
     }
     perPageRef.current = Math.max(1, n);
+
+    // If keeping position, choose the page so that the first visible system
+    // is the first whose top >= prevAlignedTop.
+    if (keepPosition && bands.length) {
+      let startIdx = bands.findIndex((b) => b.top >= prevAlignedTop - 0.5);
+      if (startIdx < 0) startIdx = bands.length - 1;
+      const perPage = Math.max(1, perPageRef.current);
+      const newPage = Math.floor(startIdx / perPage);
+      pageRef.current = Math.max(0, Math.min(newPage, Math.ceil(bands.length / perPage) - 1));
+    }
 
     if (debug) {
       // eslint-disable-next-line no-console
@@ -212,11 +239,8 @@ export default function ScoreOSMD({
       console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}`);
     }
 
-    const maxPageIdx = Math.max(0, Math.ceil(bands.length / perPageRef.current) - 1);
-    if (pageRef.current > maxPageIdx) pageRef.current = maxPageIdx;
-
     applyTranslateForPage(pageRef.current);
-  }, [FIT_PAD, applyTranslateForPage, debug]);
+  }, [applyTranslateForPage, debug]);
 
   const nextPage = useCallback((deltaPages: number) => {
     if (!readyRef.current) return;
@@ -232,7 +256,7 @@ export default function ScoreOSMD({
     if (p !== pageRef.current) applyTranslateForPage(p);
   }, [applyTranslateForPage]);
 
-  // Wheel + Keys
+  /* Wheel + keys */
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -264,7 +288,7 @@ export default function ScoreOSMD({
     };
   }, [allowScroll, nextPage, applyTranslateForPage]);
 
-  // Mount & load OSMD once
+  /* Mount + OSMD load */
   useEffect(() => {
     let localResizeObs: ResizeObserver | null = null;
     (async () => {
@@ -276,6 +300,7 @@ export default function ScoreOSMD({
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
+      // fresh instance
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -316,10 +341,10 @@ export default function ScoreOSMD({
       }
 
       pageRef.current = 0;
-      recomputeLayoutAndPage();
+      recomputeLayoutAndPage(false);
       readyRef.current = true;
 
-      // Debounced resize observer (wait 2 RAFs)
+      // Debounced resize observer → reflow & keep position
       localResizeObs = new ResizeObserver(() => {
         scheduleRecompute();
       });
@@ -338,11 +363,12 @@ export default function ScoreOSMD({
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
-      if (rafTicket1.current != null) cancelAnimationFrame(rafTicket1.current);
-      if (rafTicket2.current != null) cancelAnimationFrame(rafTicket2.current);
+      if (raf1.current != null) cancelAnimationFrame(raf1.current);
+      if (raf2.current != null) cancelAnimationFrame(raf2.current);
     };
-  }, [src, recomputeLayoutAndPage, scheduleRecompute]);
+  }, [src, scheduleRecompute, recomputeLayoutAndPage]);
 
+  /* Render scaffolding */
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden", background: "#fff" }
     : { width: "100%", height: height ?? 600, minHeight: height ?? 600, position: "relative", overflow: "hidden", background: "#fff" };
