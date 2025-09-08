@@ -31,7 +31,6 @@ function purgeWebGL(node: HTMLElement): void {
         (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
         (c.getContext("webgl2") as WebGL2RenderingContext | null);
       const ext = gl?.getExtension("WEBGL_lose_context");
-      // Lose the context if present, then remove the canvas
       (ext as { loseContext?: () => void } | null)?.loseContext?.();
       c.remove();
     } catch {
@@ -42,6 +41,7 @@ function purgeWebGL(node: HTMLElement): void {
 
 /* ---- CSS-pixel system measurement ---- */
 type Band = { top: number; bottom: number; height: number };
+
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
     svgRoot.querySelectorAll<SVGGElement>(
@@ -63,7 +63,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
         if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
         boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
       } catch {
-        /* ignore detached nodes */
+        /* detached node during layout: ignore */
       }
     }
   }
@@ -96,6 +96,29 @@ function linesThatFit(bands: Band[], containerH: number, padPx: number): number 
   return Math.max(1, n);
 }
 
+/* ---- SVG helpers (clear transform while measuring) ---- */
+function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
+  return outer.querySelector("svg") as SVGSVGElement | null;
+}
+
+function withUntransformedSvg<T>(
+  outer: HTMLDivElement,
+  fn: (svg: SVGSVGElement) => T
+): T | null {
+  const svg = getSvg(outer);
+  if (!svg) return null;
+  const prev = svg.style.transform;
+  svg.style.transform = "none"; // remove translation for true CSS-px measurements
+  try {
+    return fn(svg);
+  } finally {
+    svg.style.transform = prev;
+  }
+}
+
+/* ---- OSMD instance type with optional lifecycle ---- */
+type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
+
 /* ============================== Component =============================== */
 export default function ScoreOSMD({
   src,
@@ -111,7 +134,7 @@ export default function ScoreOSMD({
   // INNER host (OSMD renders here and may clear it)
   const osmdHostRef = useRef<HTMLDivElement | null>(null);
 
-  const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
+  const osmdRef = useRef<OSMDWithLifecycle | null>(null);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
   // DOM-based paging model
@@ -124,7 +147,7 @@ export default function ScoreOSMD({
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // constants
-  const FIT_PAD = 16; // px at bottom so next system never peeks
+  const FIT_PAD = 22; // px at bottom so next system never peeks (tuned)
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -139,7 +162,7 @@ export default function ScoreOSMD({
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
-    const svg = outer.querySelector("svg") as SVGSVGElement | null;
+    const svg = getSvg(outer);
     if (!svg) return;
 
     const bands = bandsRef.current;
@@ -152,8 +175,9 @@ export default function ScoreOSMD({
     const startBandIdx = pageIdx * perPage;
     const y = bands[startBandIdx]?.top ?? 0;
 
-    // translate upward so desired system is aligned to top
-    svg.style.transform = `translateY(${-Math.round(y)}px)`;
+    // Snap upward using ceil so the previous system never peeks by a subpixel
+    const ySnap = Math.ceil(y);
+    svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
     updateHUD();
@@ -162,10 +186,9 @@ export default function ScoreOSMD({
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
-    const svg = outer.querySelector("svg") as SVGSVGElement | null;
-    if (!svg) return;
 
-    const bands = measureSystemsPx(outer, svg);
+    // Measure with transform cleared so rects are true CSS pixels
+    const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
     const perPage = linesThatFit(bands, outer.clientHeight, FIT_PAD);
@@ -261,11 +284,10 @@ export default function ScoreOSMD({
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // Clean previous instance (typed, no `any`)
+      // Clean previous instance
       if (osmdRef.current) {
-        const old = osmdRef.current as OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
-        old.clear?.();
-        old.dispose?.();
+        osmdRef.current.clear?.();
+        osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
 
@@ -276,7 +298,7 @@ export default function ScoreOSMD({
         drawSubtitle: true,
         drawComposer: true,
         drawLyricist: true,
-      });
+      }) as OSMDWithLifecycle;
       osmdRef.current = osmd;
 
       const maybe = osmd.load(src);
@@ -291,7 +313,7 @@ export default function ScoreOSMD({
       recomputeLayoutAndPage();
       readyRef.current = true;
 
-      // Observe wrapper size (capture in local var to avoid “ref changed in cleanup” warn)
+      // Observe wrapper size (both width & height)
       localResizeObs = new ResizeObserver(() => {
         recomputeLayoutAndPage();
       });
@@ -303,16 +325,14 @@ export default function ScoreOSMD({
     });
 
     return () => {
-      // cleanup using captured locals (avoid ESLint warning)
       if (localResizeObs && wrapRef.current) localResizeObs.unobserve(wrapRef.current);
       resizeObsRef.current = null;
 
-      const inst = osmdRef.current as (OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void }) | null;
-      if (inst) {
-        inst.clear?.();
-        inst.dispose?.();
+      if (osmdRef.current) {
+        osmdRef.current.clear?.();
+        osmdRef.current.dispose?.();
+        osmdRef.current = null;
       }
-      osmdRef.current = null;
     };
   }, [src, recomputeLayoutAndPage]);
 
@@ -334,6 +354,7 @@ export default function ScoreOSMD({
     border: "1px solid #ccc",
     background: "#fff",
     cursor: "pointer",
+    fontWeight: 600,
   };
 
   return (
