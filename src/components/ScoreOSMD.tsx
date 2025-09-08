@@ -1,82 +1,80 @@
+// src/components/ScoreOSMD.client.tsx
 "use client";
 
 import { useEffect, useRef } from "react";
-import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-type OSMDInstance = OpenSheetMusicDisplay & {
-  dispose?: () => void;
-  clear?: () => void;
-};
-
-type Props = {
-  /** URL to the score under /public (e.g., "/scores/test.mxl") */
-  src: string;
-  /** Optional container class */
-  className?: string;
-  /** Optional inline styles for the container */
-  style?: React.CSSProperties;
-  /** Fixed render height in px (OSMD needs space). Default: 560 */
-  height?: number;
-};
-
-export default function ScoreOSMD({ src, className = "", style, height = 560 }: Props) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const osmdRef = useRef<OSMDInstance | null>(null);
+export default function ScoreOSMD({
+  height = 600,
+}: { height?: number }) {
+  const boxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    let disposed = false;
 
     (async () => {
       try {
-        if (!containerRef.current) return;
+        if (!boxRef.current) return;
 
-        // Import OSMD on the client
-        const mod = (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
-        const OSMD = mod.OpenSheetMusicDisplay;
+        // 1) Visual box so we KNOW the container has size
+        boxRef.current.style.border = "1px solid #999";
+        boxRef.current.style.background = "#fff";
 
-        // Clean previous instance (hot reloads)
-        if (osmdRef.current) {
-          osmdRef.current.clear?.();
-          osmdRef.current.dispose?.();
-          osmdRef.current = null;
-        }
+        // 2) Load OSMD only on the client
+        const { OpenSheetMusicDisplay } = await import("opensheetmusicdisplay");
 
-        // Initialize with plain defaults (V1 look/feel)
-        const osmd = new OSMD(containerRef.current, {
+        // 3) A built-in tiny MusicXML (no fetch, no MIME issues)
+        const TINY_XML = `<?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+        <score-partwise version="3.1">
+          <part-list><score-part id="P1"><part-name>Music</part-name></score-part></part-list>
+          <part id="P1">
+            <measure number="1">
+              <attributes><divisions>1</divisions><key><fifths>0</fifths></key>
+              <time><beats>4</beats><beat-type>4</beat-type></time>
+              <clef><sign>G</sign><line>2</line></clef></attributes>
+              <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+              <note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+              <note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+              <note><pitch><step>F</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+            </measure>
+          </part>
+        </score-partwise>`;
+
+        // 4) Wait a tick so layout settles; render AFTER the box has nonzero size
+        await new Promise(r => requestAnimationFrame(() => r(null)));
+        await new Promise(r => requestAnimationFrame(() => r(null))); // two RAFs to be extra safe
+
+        const osmd = new OpenSheetMusicDisplay(boxRef.current, {
           autoResize: true,
-          drawTitle: true,
-          drawSubtitle: true,
-          drawComposer: true,
-          drawLyricist: true,
-        }) as OSMDInstance;
+          drawTitle: false,
+          drawSubtitle: false,
+          drawComposer: false,
+          drawLyricist: false,
+        });
 
-        osmdRef.current = osmd;
+        // Newer OSMD accepts raw XML strings; if yours doesn’t, swap to .load("/scores/…")
+        await osmd.load(TINY_XML);
+        if (!disposed) await osmd.render();
 
-        // ✅ Simple URL load (no type issues)
-        await osmd.load(src);
-        if (cancelled) return;
-
-        await osmd.render();
+        // Force a resize once more in case initial width was 0
+        if (!disposed) osmd.zoom = 1.0;
       } catch (e) {
-        console.error("OSMD load/render error:", e);
+        console.error("OSMD test failed:", e);
       }
     })();
 
-    return () => {
-      cancelled = true;
-      if (osmdRef.current) {
-        osmdRef.current.clear?.();
-        osmdRef.current.dispose?.();
-        osmdRef.current = null;
-      }
-    };
-  }, [src]);
+    return () => { disposed = true; };
+  }, []);
 
   return (
     <div
-      ref={containerRef}
-      className={className}
-      style={{ width: "100%", minHeight: height, height, ...style }}
+      ref={boxRef}
+      style={{
+        width: "100%",
+        minHeight: height,
+        height,
+        overflow: "auto",
+      }}
     />
   );
 }
