@@ -4,65 +4,65 @@
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-// ---- Minimal shape types (so we don't use `any`) ----
-interface Point { y?: number }
-interface Size { height?: number }
-interface BoundingBox {
-  AbsolutePosition?: Point;
-  Size?: Size;
-  TopBorder?: number;
-  BottomBorder?: number;
-}
-interface MusicSystem { BoundingBox?: BoundingBox; boundingBox?: BoundingBox }
-interface MusicPage { MusicSystems?: MusicSystem[] }
-interface GraphicalMusicSheet { MusicPages?: MusicPage[] }
-
 type OSMDInstance = OpenSheetMusicDisplay & {
   dispose?: () => void;
   clear?: () => void;
-  GraphicalMusicSheet?: GraphicalMusicSheet;
 };
 
 type Props = {
   /** URL under /public, e.g. "/scores/gymnopedie-no-1-satie.mxl" */
   src: string;
-  /** Fixed render height in px (give OSMD space). Default: 600 */
+  /** Fixed render height (px). Give OSMD space. Default: 600 */
   height?: number;
   className?: string;
   style?: React.CSSProperties;
 };
 
-// Narrow Promise check (no `any`)
+// “await if promise” without lint noise
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
 
-// Measure per-system vertical extents after render (no `any`)
-function measureSystems(osmd: OSMDInstance) {
-  const results: Array<{ pageIndex: number; systemIndex: number; topY: number; bottomY: number; height: number }> = [];
-  const gms = osmd.GraphicalMusicSheet;
-  const pages = gms?.MusicPages ?? [];
+/** Measure systems from the rendered SVG DOM using getBBox(). */
+function measureSystemsFromDOM(container: HTMLDivElement) {
+  const out: Array<{ index: number; top: number; bottom: number; height: number }> = [];
 
-  for (let p = 0; p < pages.length; p++) {
-    const page = pages[p];
-    const systems = page?.MusicSystems ?? [];
-    for (let s = 0; s < systems.length; s++) {
-      const sys = systems[s];
-      const bb = sys?.BoundingBox ?? sys?.boundingBox;
-      if (!bb) continue;
+  const svg = container.querySelector("svg");
+  if (!svg) return out;
 
-      const top = bb.AbsolutePosition?.y ?? 0;
-      const sizeH = bb.Size?.height ?? 0;
+  // Try common OSMD system group selectors first; fall back to any g with “system” in id/class.
+  const sysGroups = Array.from(
+    svg.querySelectorAll<SVGGElement>(
+      [
+        'g[id^="system-"]',
+        'g[id^="osmdSystem"]',
+        'g[class*="system"]',
+        'g[class*="System"]',
+      ].join(",")
+    )
+  );
 
-      const topBorder = Number.isFinite(bb.TopBorder) ? (bb.TopBorder as number) : top;
-      const bottomBorder = Number.isFinite(bb.BottomBorder) ? (bb.BottomBorder as number) : top + sizeH;
+  const groups = sysGroups.length
+    ? sysGroups
+    : Array.from(svg.querySelectorAll<SVGGElement>('g[id*="system"], g[class*="system"]'));
 
-      const topY = Math.min(top, topBorder);
-      const bottomY = Math.max(top + sizeH, bottomBorder);
-      results.push({ pageIndex: p, systemIndex: s, topY, bottomY, height: bottomY - topY });
+  // If we still found nothing, bail early.
+  if (!groups.length) return out;
+
+  groups.forEach((g, i) => {
+    try {
+      const box = g.getBBox(); // SVG user units (pixels in our case)
+      if (box && isFinite(box.height) && box.height > 0) {
+        out.push({ index: i, top: box.y, bottom: box.y + box.height, height: box.height });
+      }
+    } catch {
+      // getBBox can throw if element is not rendered; ignore and continue
     }
-  }
-  return results;
+  });
+
+  // Sort by vertical position
+  out.sort((a, b) => a.top - b.top);
+  return out;
 }
 
 export default function ScoreOSMD({ src, height = 600, className = "", style }: Props) {
@@ -75,12 +75,13 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
 
       // Ensure the drawing box has real space before OSMD measures layout
       boxRef.current.style.background = "#fff";
-      // Two RAFs help if parents are toggling visibility/layout
-      await new Promise<void>(r => requestAnimationFrame(() => r()));
-      await new Promise<void>(r => requestAnimationFrame(() => r()));
+      // Let layout settle (fixes zero-width parent timing)
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
 
       // Import OSMD only on the client
-      const { OpenSheetMusicDisplay } = (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
+      const { OpenSheetMusicDisplay } =
+        (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
       // Clean previous instance (dev hot-reloads / StrictMode)
       if (osmdRef.current) {
@@ -99,38 +100,39 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
 
       osmdRef.current = osmd;
 
-      // LOAD (await only if it's actually a Promise per this OSMD version)
+      // LOAD (await only if this OSMD returns a Promise)
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
 
       // RENDER (typed as void in some versions)
       osmd.render();
 
-      // MEASURE & LOG per-system vertical envelope
-      const systems = measureSystems(osmd);
+      // ---- DOM-based system measurements ----
+      // One more RAF so the SVG is definitely in the DOM
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      const systems = boxRef.current ? measureSystemsFromDOM(boxRef.current) : [];
+
+      // Console readout
       console.table(
-        systems.map(({ pageIndex, systemIndex, topY, bottomY, height }) => ({
-          page: pageIndex + 1,
-          line: systemIndex + 1,
-          topY: topY.toFixed(2),
-          bottomY: bottomY.toFixed(2),
-          height: height.toFixed(2),
+        systems.map((s, k) => ({
+          line: k + 1,
+          top: s.top.toFixed(1),
+          bottom: s.bottom.toFixed(1),
+          height: s.height.toFixed(1),
         }))
       );
-      const tallest = systems.reduce(
-        (acc, s) => (s.height > acc.height ? s : acc),
-        { pageIndex: 0, systemIndex: 0, topY: 0, bottomY: 0, height: 0 }
-      );
-      console.log(
-        `Tallest line → page ${tallest.pageIndex + 1}, line ${tallest.systemIndex + 1}, height ${tallest.height.toFixed(
-          2
-        )} (engraving units)`
-      );
-    })().catch(err => {
+      if (systems.length) {
+        const tallest = systems.reduce((a, b) => (b.height > a.height ? b : a), systems[0]);
+        console.log(
+          `Tallest line → line ${systems.indexOf(tallest) + 1}, height ${tallest.height.toFixed(1)} px`
+        );
+      } else {
+        console.warn("No system groups found in SVG — selectors may need adjustment for this score.");
+      }
+    })().catch((err) => {
       console.error("OSMD load/render error:", err);
     });
 
-    // Cleanup
     return () => {
       if (osmdRef.current) {
         osmdRef.current.clear?.();
