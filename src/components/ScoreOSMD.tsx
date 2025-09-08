@@ -104,7 +104,7 @@ function analyzeBands(container: HTMLDivElement): Band[] {
   return bands;
 }
 
-/* NEW: choose last fully visible system by its bottom edge */
+/* choose last fully visible system by its bottom edge */
 function chooseLastFullyVisibleIndex(bands: Band[], container: HTMLDivElement, padPx: number): number {
   const limit = container.clientHeight - padPx; // pad so next line can’t “peek”
   let last = -1;
@@ -115,6 +115,7 @@ function chooseLastFullyVisibleIndex(bands: Band[], container: HTMLDivElement, p
   return Math.max(0, last); // at least the first line
 }
 
+/* map system index → last measure number */
 function getLastMeasureNumberForSystem(osmd: OSMDInstance, systemIndex: number): number {
   const gms = osmd.GraphicalMusicSheet;
   const page0: MusicPage | undefined = gms?.MusicPages?.[0];
@@ -138,6 +139,7 @@ function getLastMeasureNumberForSystem(osmd: OSMDInstance, systemIndex: number):
   return best;
 }
 
+/* narrow options type for setOptions */
 type MeasureSliceOptions = { drawFromMeasureNumber?: number; drawUpToMeasureNumber?: number; };
 function setMeasureOptions(osmd: OSMDInstance, opts: MeasureSliceOptions) {
   (osmd as unknown as { setOptions: (o: MeasureSliceOptions) => void }).setOptions(opts);
@@ -159,7 +161,8 @@ export default function ScoreOSMD({
   const recomputingRef = useRef<boolean>(false);
   const currentUpToRef = useRef<number>(0);
 
-  const FIT_PAD_PX = 16; // bigger margin to avoid any “peek”
+  const FIT_PAD_PX = 16;   // safety margin to prevent peeking
+  const VALIDATE_MAX_STEPS = 3; // cap iterative shrink
 
   const scheduleRecompute = () => {
     if (debounceTimer.current) {
@@ -176,36 +179,57 @@ export default function ScoreOSMD({
       try {
         const prevScrollTop = container.scrollTop;
 
-        // Remove stray canvases/WebGL (belt-and-suspenders)
         purgeWebGL(container);
 
-        // Phase 1: full render (clear slice)
+        // Phase 1: clear slice → full render
         setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: Number.MAX_SAFE_INTEGER });
         osmd.render();
         await afterPaint();
 
-        const bands = analyzeBands(container);
+        // Measure & pick initial last-fit index
+        let bands = analyzeBands(container);
         if (!bands.length) return;
 
         if (debug) {
           // eslint-disable-next-line no-console
           console.table(bands.map((b, i) => ({
-            line: i + 1,
-            top: b.top.toFixed(1),
-            bottom: b.bottom.toFixed(1),
-            height: b.height.toFixed(1),
+            line: i + 1, top: b.top.toFixed(1), bottom: b.bottom.toFixed(1), height: b.height.toFixed(1),
           })));
         }
 
-        // Phase 2: pick last fully visible by bottom edge
-        const lastIdx = chooseLastFullyVisibleIndex(bands, container, FIT_PAD_PX);
-        const upToMeasure = getLastMeasureNumberForSystem(osmd, lastIdx);
+        let lastIdx = chooseLastFullyVisibleIndex(bands, container, FIT_PAD_PX);
+        let upToMeasure = getLastMeasureNumberForSystem(osmd, lastIdx);
 
+        // Phase 2: apply slice if changed
         if (upToMeasure && upToMeasure !== currentUpToRef.current) {
           setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: upToMeasure });
           osmd.render();
           currentUpToRef.current = upToMeasure;
           await afterPaint();
+        }
+
+        // Phase 3: VALIDATE — re-measure; if last band's bottom exceeds limit, shrink one system and re-slice
+        let steps = 0;
+        const limit = container.clientHeight - FIT_PAD_PX;
+        while (steps < VALIDATE_MAX_STEPS) {
+          bands = analyzeBands(container);
+          if (!bands.length) break;
+
+          const lastBand = bands[Math.min(bands.length - 1, lastIdx)];
+          if (lastBand && lastBand.bottom <= limit) break; // fits — done
+
+          // shrink by one system
+          if (lastIdx <= 0) break;
+          lastIdx -= 1;
+          upToMeasure = getLastMeasureNumberForSystem(osmd, lastIdx);
+          if (!upToMeasure || upToMeasure === currentUpToRef.current) break;
+
+          setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: upToMeasure });
+          osmd.render();
+          currentUpToRef.current = upToMeasure;
+          await afterPaint();
+
+          steps += 1;
         }
 
         container.scrollTop = prevScrollTop;
@@ -231,7 +255,7 @@ export default function ScoreOSMD({
       }
 
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
-        backend: "svg" as const, // ensures SVG backend (no WebGL)
+        backend: "svg" as const, // ensure SVG (no WebGL)
         autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
@@ -245,17 +269,16 @@ export default function ScoreOSMD({
       osmd.render();
       currentUpToRef.current = 0;
 
-      // Initial slice
+      // Initial pass
       scheduleRecompute();
 
-      // Observe BOTH width and height: any dimension change can affect wrapping/fit
+      // Observe BOTH width and height; any dimension change can affect wrapping/fit
       if (!resizeObsRef.current) {
         resizeObsRef.current = new ResizeObserver((entries) => {
           const cr = entries[0]?.contentRect;
           if (!cr) return;
-          const w = Math.round(cr.width);
-          const h = Math.round(cr.height);
-          if (w || h) scheduleRecompute();
+          // Any size change triggers recompute
+          scheduleRecompute();
         });
         resizeObsRef.current.observe(boxRef.current);
       }
