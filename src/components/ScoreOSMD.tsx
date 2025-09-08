@@ -4,7 +4,7 @@
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* --------- Minimal structural types to avoid `any` --------- */
+/* ---- Minimal structural types (no `any`) ---- */
 interface SourceMeasure { MeasureNumber?: number }
 interface GraphicalMeasure {
   SourceMeasure?: SourceMeasure;
@@ -14,11 +14,11 @@ interface GraphicalMeasure {
 }
 interface StaffLine {
   Measures?: GraphicalMeasure[];
-  measures?: GraphicalMeasure[]; // some builds use lowercase
+  measures?: GraphicalMeasure[];
 }
 interface MusicSystem {
   StaffLines?: StaffLine[];
-  staffLines?: StaffLine[]; // some builds use lowercase
+  staffLines?: StaffLine[];
 }
 interface MusicPage { MusicSystems?: MusicSystem[] }
 interface GraphicalMusicSheet { MusicPages?: MusicPage[] }
@@ -40,7 +40,7 @@ type Props = {
   style?: React.CSSProperties;
 };
 
-/* Await-if-promise helper (OSMD typings differ across versions) */
+/* Await-if-promise helper */
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
@@ -52,7 +52,7 @@ function afterPaint(): Promise<void> {
   );
 }
 
-/* Measure vertical “bands” (systems) from rendered SVG */
+/* Measure vertical bands (systems) from rendered SVG */
 function analyzeBands(container: HTMLDivElement) {
   const svg = container.querySelector("svg");
   if (!svg) return [] as Array<{ top: number; bottom: number; height: number }>;
@@ -76,15 +76,14 @@ function analyzeBands(container: HTMLDivElement) {
         if (b.height < 8 || b.width < 40) continue; // ignore tiny fragments
         boxes.push({ y: b.y, bottom: b.y + b.height, height: b.height, width: b.width });
       } catch {
-        /* skip non-rendered nodes */
+        /* non-rendered nodes */
       }
     }
   }
 
   boxes.sort((a, b) => a.y - b.y);
 
-  // Cluster vertically into bands/systems
-  const GAP = 24; // px
+  const GAP = 24; // px gap to start a new band/system
   const bands: Array<{ top: number; bottom: number; height: number }> = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -99,7 +98,7 @@ function analyzeBands(container: HTMLDivElement) {
   return bands;
 }
 
-/* Compute index of last fully visible system that fits in container height */
+/* Index of last fully visible system that fits in container height */
 function computeLastFullyVisibleIndex(
   systems: Array<{ top: number; bottom: number; height: number }>,
   container: HTMLDivElement
@@ -109,11 +108,8 @@ function computeLastFullyVisibleIndex(
   for (let i = 0; i < systems.length; i++) {
     const h = Math.max(0, systems[i].height);
     if (h === 0) continue;
-    if (sum + h <= maxH) {
-      sum += h;
-    } else {
-      return i - 1; // previous line fit, current would overflow
-    }
+    if (sum + h <= maxH) sum += h;
+    else return i - 1; // previous fit, current would overflow
   }
   return systems.length - 1; // all fit
 }
@@ -143,15 +139,13 @@ function getLastMeasureNumberForSystem(osmd: OSMDInstance, systemIndex: number):
   return best;
 }
 
-/* Narrowed type for calling setOptions with just the measure slice fields */
+/* Narrow options type for setOptions */
 type MeasureSliceOptions = {
   drawFromMeasureNumber?: number;
   drawUpToMeasureNumber?: number;
 };
 
-/* Safe helper to call osmd.setOptions with our narrow options type */
 function setMeasureOptions(osmd: OSMDInstance, opts: MeasureSliceOptions) {
-  // Structural call without `any`
   (osmd as unknown as { setOptions: (o: MeasureSliceOptions) => void }).setOptions(opts);
 }
 
@@ -165,12 +159,12 @@ export default function ScoreOSMD({
   const boxRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDInstance | null>(null);
 
-  // control flags
+  const resizeObsRef = useRef<ResizeObserver | null>(null);
   const debounceTimer = useRef<number | null>(null);
-  const isSlicingRef = useRef<boolean>(false);
+  const recomputingRef = useRef<boolean>(false);
   const currentUpToRef = useRef<number>(0);
 
-  // Debounced recompute: full render → measure → slice
+  // Debounced recompute driven by WIDTH changes (and initial load)
   const scheduleRecompute = () => {
     if (debounceTimer.current) {
       window.clearTimeout(debounceTimer.current);
@@ -180,11 +174,14 @@ export default function ScoreOSMD({
       const container = boxRef.current;
       const osmd = osmdRef.current;
       if (!container || !osmd) return;
-      if (isSlicingRef.current) return;
+      if (recomputingRef.current) return; // guard
 
-      isSlicingRef.current = true;
+      recomputingRef.current = true;
       try {
-        // 1) Full render (remove any previous slice)
+        // Preserve scroll position so the view doesn't jump
+        const prevScrollTop = container.scrollTop;
+
+        // Phase 1: full render (remove slice)
         setMeasureOptions(osmd, {
           drawFromMeasureNumber: 1,
           drawUpToMeasureNumber: Number.MAX_SAFE_INTEGER,
@@ -192,31 +189,34 @@ export default function ScoreOSMD({
         osmd.render();
         await afterPaint();
 
-        // 2) Measure systems from DOM
+        // Measure systems from DOM
         const systems = analyzeBands(container);
         if (!systems.length) {
-          isSlicingRef.current = false;
+          recomputingRef.current = false;
           return;
         }
 
-        // 3) Decide how many lines fit fully
-        const lastIdx = computeLastFullyVisibleIndex(systems, container);
-        const safeIdx = Math.max(0, lastIdx); // ensure at least first line
+        // Decide how many lines fit fully (at least 1)
+        const lastIdx = Math.max(0, computeLastFullyVisibleIndex(systems, container));
 
-        // 4) Map that system to its last measure number
-        const upToMeasure = getLastMeasureNumberForSystem(osmd, safeIdx);
+        // Map that system to its last measure number
+        const upToMeasure = getLastMeasureNumberForSystem(osmd, lastIdx);
+
+        // Phase 2: apply slice only if changed
         if (upToMeasure && upToMeasure !== currentUpToRef.current) {
-          setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: upToMeasure });
+          setMeasureOptions(osmd, {
+            drawFromMeasureNumber: 1,
+            drawUpToMeasureNumber: upToMeasure,
+          });
           osmd.render();
           currentUpToRef.current = upToMeasure;
           await afterPaint();
         }
-      } catch (err) {
-        // Log without disabling eslint rules
-        // eslint-disable-next-line no-console
-        console.error("Slice recalculation error:", err);
+
+        // Restore scrollTop (prevents bouncing to top)
+        container.scrollTop = prevScrollTop;
       } finally {
-        isSlicingRef.current = false;
+        recomputingRef.current = false;
       }
     }, 120);
   };
@@ -236,7 +236,9 @@ export default function ScoreOSMD({
         osmdRef.current = null;
       }
 
+      // Force SVG backend to avoid canvas/WebGL contexts
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
+        backend: "svg" as const,
         autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
@@ -245,20 +247,23 @@ export default function ScoreOSMD({
       }) as OSMDInstance;
       osmdRef.current = osmd;
 
+      // Load + initial render
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
       osmd.render();
       currentUpToRef.current = 0;
 
-      // Observe DOM mutations (OSMD reflows/updates SVG), then recompute slice
-      const mo = new MutationObserver(() => scheduleRecompute());
-      mo.observe(boxRef.current, { subtree: true, childList: true, attributes: true });
-
-      // Initial slice
+      // Recompute once after first paint
       scheduleRecompute();
 
-      // cleanup observer on effect re-run/unmount
-      return () => mo.disconnect();
+      // Observe container **width** only; OSMD auto-resizes on width changes
+      if (!resizeObsRef.current) {
+        resizeObsRef.current = new ResizeObserver((entries) => {
+          const w = Math.round(entries[0]?.contentRect?.width ?? 0);
+          if (w) scheduleRecompute();
+        });
+        resizeObsRef.current.observe(boxRef.current);
+      }
     })().catch((err) => {
       // eslint-disable-next-line no-console
       console.error("OSMD init error:", err);
@@ -269,6 +274,10 @@ export default function ScoreOSMD({
         window.clearTimeout(debounceTimer.current);
         debounceTimer.current = null;
       }
+      if (resizeObsRef.current && boxRef.current) {
+        resizeObsRef.current.unobserve(boxRef.current);
+      }
+      resizeObsRef.current = null;
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
