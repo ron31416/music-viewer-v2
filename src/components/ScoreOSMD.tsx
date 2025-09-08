@@ -119,8 +119,8 @@ export default function ScoreOSMD({
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // Tunables
-  const TOP_PAD = 8;   // ↑ a little more air at top
-  const FIT_PAD = 22;  // bottom safety
+  const TOP_PAD_MAX = 8; // max cushion at the top (px)
+  const FIT_PAD = 22;    // bottom safety (px)
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -132,6 +132,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
+  // Apply translation AND update bottom mask; dynamic top pad prevents truncation at threshold
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -150,13 +151,21 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const lastBottom = bands[lastIdx]?.bottom ?? startTop;
 
-    // Snap upward and include top pad
-    const ySnap = Math.ceil(startTop - TOP_PAD);
+    // ---- dynamic top pad ----
+    const containerH = outer.clientHeight;
+    const limit = containerH - FIT_PAD; // bottom edge we must not cross
+    const needed = lastBottom - startTop; // height of the visible lines (no pad)
+    // room left for top pad without pushing bottom below limit
+    const slack = Math.max(0, limit - needed);
+    const pad = Math.min(TOP_PAD_MAX, slack); // shrink pad when space is tight
+
+    // Snap upward with dynamic pad
+    const ySnap = Math.ceil(startTop - pad);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Bottom mask: hide anything below the last fully visible system
-    const visibleBottom = (lastBottom - startTop) + TOP_PAD;
+    // Bottom mask just below the last fully visible system
+    const visibleBottom = (lastBottom - startTop) + pad;
     const maskTop = Math.max(0, Math.ceil(visibleBottom));
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
@@ -164,8 +173,9 @@ export default function ScoreOSMD({
     }
 
     updateHUD();
-  }, [TOP_PAD, updateHUD]);
+  }, [FIT_PAD, TOP_PAD_MAX, updateHUD]);
 
+  // Recompute bands + how many fit (conservative: assumes we might need full TOP_PAD_MAX)
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -173,8 +183,8 @@ export default function ScoreOSMD({
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    // **Fix**: subtract TOP_PAD from available height so the pad doesn’t steal space
-    const available = Math.max(0, outer.clientHeight - FIT_PAD - TOP_PAD);
+    // Conservative per-page count (reserve full top pad so we never overcount)
+    const available = Math.max(0, outer.clientHeight - FIT_PAD - TOP_PAD_MAX);
     let n = 0;
     for (const b of bands) {
       if (b.bottom - bands[0].top <= available) n += 1;
@@ -184,14 +194,7 @@ export default function ScoreOSMD({
 
     if (debug) {
       // eslint-disable-next-line no-console
-      console.table(
-        bands.map((b, i) => ({
-          line: i + 1,
-          top: b.top.toFixed(1),
-          bottom: b.bottom.toFixed(1),
-          height: b.height.toFixed(1),
-        }))
-      );
+      console.table(bands.map((b, i) => ({ line: i + 1, top: b.top.toFixed(1), bottom: b.bottom.toFixed(1), height: b.height.toFixed(1) })));
       // eslint-disable-next-line no-console
       console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}`);
     }
@@ -200,25 +203,23 @@ export default function ScoreOSMD({
     if (pageRef.current > maxPageIdx) pageRef.current = maxPageIdx;
 
     applyTranslateForPage(pageRef.current);
-  }, [FIT_PAD, TOP_PAD, applyTranslateForPage, debug]);
+  }, [FIT_PAD, TOP_PAD_MAX, applyTranslateForPage, debug]);
 
-  const nextPage = useCallback(
-    (deltaPages: number) => {
-      if (!readyRef.current) return;
-      const total = bandsRef.current.length;
-      const perPage = Math.max(1, perPageRef.current);
-      if (!total) return;
+  const nextPage = useCallback((deltaPages: number) => {
+    if (!readyRef.current) return;
+    const total = bandsRef.current.length;
+    const perPage = Math.max(1, perPageRef.current);
+    if (!total) return;
 
-      const maxPageIdx = Math.max(0, Math.ceil(total / perPage) - 1);
-      let p = pageRef.current + deltaPages;
-      if (p < 0) p = 0;
-      if (p > maxPageIdx) p = maxPageIdx;
+    const maxPageIdx = Math.max(0, Math.ceil(total / perPage) - 1);
+    let p = pageRef.current + deltaPages;
+    if (p < 0) p = 0;
+    if (p > maxPageIdx) p = maxPageIdx;
 
-      if (p !== pageRef.current) applyTranslateForPage(p);
-    },
-    [applyTranslateForPage]
-  );
+    if (p !== pageRef.current) applyTranslateForPage(p);
+  }, [applyTranslateForPage]);
 
+  // Wheel + Keys
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -250,6 +251,7 @@ export default function ScoreOSMD({
     };
   }, [allowScroll, nextPage, applyTranslateForPage]);
 
+  // Mount & load OSMD once
   useEffect(() => {
     let localResizeObs: ResizeObserver | null = null;
     (async () => {
@@ -284,7 +286,7 @@ export default function ScoreOSMD({
 
       purgeWebGL(wrapper);
 
-      // create mask element once
+      // create bottom mask once
       if (!maskRef.current && wrapper) {
         const mask = document.createElement("div");
         mask.style.position = "absolute";
