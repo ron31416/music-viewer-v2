@@ -4,7 +4,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* ---- Props ---- */
 type Props = {
   src: string;
   fillParent?: boolean;
@@ -15,7 +14,6 @@ type Props = {
   style?: React.CSSProperties;
 };
 
-/* ---- Helpers ---- */
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as { then?: unknown });
 }
@@ -29,14 +27,12 @@ function purgeWebGL(node: HTMLElement): void {
         (c.getContext("webgl") as WebGLRenderingContext | null) ||
         (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
         (c.getContext("webgl2") as WebGL2RenderingContext | null);
-      const ext = gl?.getExtension("WEBGL_lose_context");
-      (ext as { loseContext?: () => void } | null)?.loseContext?.();
+      (gl?.getExtension("WEBGL_lose_context") as { loseContext?: () => void } | null)?.loseContext?.();
       c.remove();
     } catch {}
   }
 }
 
-/* ---- CSS-pixel system measurement ---- */
 type Band = { top: number; bottom: number; height: number };
 
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
@@ -79,17 +75,6 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   return bands;
 }
 
-function linesThatFit(bands: Band[], containerH: number, padPx: number): number {
-  const limit = containerH - padPx;
-  let n = 0;
-  for (const b of bands) {
-    if (b.bottom <= limit) n += 1;
-    else break;
-  }
-  return Math.max(1, n);
-}
-
-/* ---- SVG helpers ---- */
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg") as SVGSVGElement | null;
 }
@@ -108,10 +93,8 @@ function withUntransformedSvg<T>(
   }
 }
 
-/* ---- OSMD instance type ---- */
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
-/* ============================== Component =============================== */
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -126,21 +109,18 @@ export default function ScoreOSMD({
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
-  // DOM-based model
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
   const pageRef = useRef<number>(0);
   const readyRef = useRef<boolean>(false);
 
-  // Bottom mask overlay (hides any partial next system)
   const maskRef = useRef<HTMLDivElement | null>(null);
 
-  // HUD
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
-  // constants
-  const TOP_PAD = 6;   // px: a little headroom so slurs don’t kiss the top
-  const FIT_PAD = 22;  // px: bottom safety
+  // Tunables
+  const TOP_PAD = 8;   // ↑ a little more air at top
+  const FIT_PAD = 22;  // bottom safety
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -152,7 +132,6 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  // Apply translation AND update the bottom mask to hide partials
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -171,15 +150,15 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const lastBottom = bands[lastIdx]?.bottom ?? startTop;
 
-    const ySnap = Math.ceil(startTop - TOP_PAD); // small cushion at the top
+    // Snap upward and include top pad
+    const ySnap = Math.ceil(startTop - TOP_PAD);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Where to place the bottom mask (relative to container)
-    const visibleBottom = (lastBottom - startTop) + TOP_PAD; // last fully visible line bottom relative to top
+    // Bottom mask: hide anything below the last fully visible system
+    const visibleBottom = (lastBottom - startTop) + TOP_PAD;
     const maskTop = Math.max(0, Math.ceil(visibleBottom));
-    // position the mask
-    if (maskRef.current && wrapRef.current) {
+    if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
     }
@@ -194,8 +173,14 @@ export default function ScoreOSMD({
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    const perPage = linesThatFit(bands, outer.clientHeight, FIT_PAD);
-    perPageRef.current = perPage;
+    // **Fix**: subtract TOP_PAD from available height so the pad doesn’t steal space
+    const available = Math.max(0, outer.clientHeight - FIT_PAD - TOP_PAD);
+    let n = 0;
+    for (const b of bands) {
+      if (b.bottom - bands[0].top <= available) n += 1;
+      else break;
+    }
+    perPageRef.current = Math.max(1, n);
 
     if (debug) {
       // eslint-disable-next-line no-console
@@ -208,14 +193,14 @@ export default function ScoreOSMD({
         }))
       );
       // eslint-disable-next-line no-console
-      console.log(`linesPerPage=${perPage}, totalSystems=${bands.length}, page=${pageRef.current + 1}`);
+      console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}`);
     }
 
-    const maxPageIdx = Math.max(0, Math.ceil(bands.length / perPage) - 1);
+    const maxPageIdx = Math.max(0, Math.ceil(bands.length / perPageRef.current) - 1);
     if (pageRef.current > maxPageIdx) pageRef.current = maxPageIdx;
 
     applyTranslateForPage(pageRef.current);
-  }, [FIT_PAD, applyTranslateForPage, debug]);
+  }, [FIT_PAD, TOP_PAD, applyTranslateForPage, debug]);
 
   const nextPage = useCallback(
     (deltaPages: number) => {
@@ -229,14 +214,11 @@ export default function ScoreOSMD({
       if (p < 0) p = 0;
       if (p > maxPageIdx) p = maxPageIdx;
 
-      if (p !== pageRef.current) {
-        applyTranslateForPage(p);
-      }
+      if (p !== pageRef.current) applyTranslateForPage(p);
     },
     [applyTranslateForPage]
   );
 
-  // Wheel + Keys
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -268,7 +250,6 @@ export default function ScoreOSMD({
     };
   }, [allowScroll, nextPage, applyTranslateForPage]);
 
-  // Mount & load OSMD once
   useEffect(() => {
     let localResizeObs: ResizeObserver | null = null;
     (async () => {
@@ -303,12 +284,26 @@ export default function ScoreOSMD({
 
       purgeWebGL(wrapper);
 
-      // First compute/page
+      // create mask element once
+      if (!maskRef.current && wrapper) {
+        const mask = document.createElement("div");
+        mask.style.position = "absolute";
+        mask.style.left = "0";
+        mask.style.right = "0";
+        mask.style.top = "0";
+        mask.style.bottom = "0";
+        mask.style.background = "#fff";
+        mask.style.pointerEvents = "none";
+        mask.style.zIndex = "5";
+        mask.style.display = "none";
+        wrapper.appendChild(mask);
+        maskRef.current = mask;
+      }
+
       pageRef.current = 0;
       recomputeLayoutAndPage();
       readyRef.current = true;
 
-      // Observe wrapper size
       localResizeObs = new ResizeObserver(() => {
         recomputeLayoutAndPage();
       });
@@ -322,7 +317,6 @@ export default function ScoreOSMD({
     return () => {
       if (localResizeObs && wrapRef.current) localResizeObs.unobserve(wrapRef.current);
       resizeObsRef.current = null;
-
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -331,7 +325,6 @@ export default function ScoreOSMD({
     };
   }, [src, recomputeLayoutAndPage]);
 
-  /* ---- UI ---- */
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden", background: "#fff" }
     : { width: "100%", height: height ?? 600, minHeight: height ?? 600, position: "relative", overflow: "hidden", background: "#fff" };
@@ -354,27 +347,8 @@ export default function ScoreOSMD({
 
   return (
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
-      {/* OSMD renders here */}
       <div ref={osmdHostRef} style={osmdHostStyle} />
 
-      {/* Bottom mask to hide any partial next system */}
-      <div
-        ref={maskRef}
-        aria-hidden
-        style={{
-          position: "absolute",
-          left: 0,
-          right: 0,
-          top: 0,        // updated dynamically
-          bottom: 0,
-          background: "#fff",
-          pointerEvents: "none",
-          zIndex: 5,
-          display: "none",
-        }}
-      />
-
-      {/* Overlay controls */}
       <div style={{ position: "absolute", right: 10, top: 10, display: "flex", gap: 8, zIndex: 10 }}>
         <button type="button" style={btn} onClick={() => nextPage(-1)}>Prev</button>
         <button type="button" style={btn} onClick={() => nextPage(1)}>Next</button>
