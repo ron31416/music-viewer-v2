@@ -1,7 +1,7 @@
 import ScoreOSMD from "@/components/ScoreOSMD";
 
 // Put your actual file under /public/scores so it serves at /scores/...
-const SCORE_SRC = "/scores/test.mxl";
+const SCORE_SRC = "/scores/gymnopedie-no-1-satie.mxl";
 
 export default function Page() {
   return (
