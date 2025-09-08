@@ -1,9 +1,10 @@
+// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* Props */
+/* ───────────── Types & small helpers ───────────── */
 type Props = {
   src: string;
   fillParent?: boolean;
@@ -14,14 +15,15 @@ type Props = {
   style?: React.CSSProperties;
 };
 
-/* Small helpers */
+type Band = { top: number; bottom: number; height: number };
+
+type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
+
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as { then?: unknown });
 }
 function afterPaint(): Promise<void> {
-  return new Promise((r) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => r()))
-  );
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 }
 function purgeWebGL(node: HTMLElement): void {
   for (const c of Array.from(node.querySelectorAll("canvas"))) {
@@ -36,8 +38,24 @@ function purgeWebGL(node: HTMLElement): void {
   }
 }
 
-/* Band = one system line in CSS px, relative to wrapper top */
-type Band = { top: number; bottom: number; height: number };
+function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
+  return outer.querySelector("svg") as SVGSVGElement | null;
+}
+
+function withUntransformedSvg<T>(
+  outer: HTMLDivElement,
+  fn: (svg: SVGSVGElement) => T
+): T | null {
+  const svg = getSvg(outer);
+  if (!svg) return null;
+  const prev = svg.style.transform;
+  svg.style.transform = "none";
+  try {
+    return fn(svg);
+  } finally {
+    svg.style.transform = prev;
+  }
+}
 
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
@@ -56,7 +74,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
       try {
         const r = g.getBoundingClientRect();
         if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-        if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
+        if (r.height < 8 || r.width < 40) continue;
         boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
       } catch {}
     }
@@ -64,7 +82,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
 
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px between systems
+  const GAP = 18; // px gap between consecutive elements to consider a new system
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -79,33 +97,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   return bands;
 }
 
-/* SVG + transform helpers */
-function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
-  return outer.querySelector("svg") as SVGSVGElement | null;
-}
-function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
-  const svg = getSvg(outer);
-  if (!svg) return null;
-  const prev = svg.style.transform;
-  svg.style.transform = "none";
-  try {
-    return fn(svg);
-  } finally {
-    svg.style.transform = prev;
-  }
-}
-function getCurrentTranslateY(outer: HTMLDivElement): number {
-  const svg = getSvg(outer);
-  if (!svg) return 0;
-  // expect "translateY(-123px)" or empty
-  const m = /translateY\((-?\d+\.?\d*)px\)/.exec(svg.style.transform || "");
-  return m ? parseFloat(m[1]) : 0;
-}
-
-/* OSMD type */
-type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
-
-/* Component */
+/* ───────────── Component ───────────── */
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -120,21 +112,23 @@ export default function ScoreOSMD({
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
+  // Layout model
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
   const pageRef = useRef<number>(0);
+  const currentStartIdxRef = useRef<number>(0); // ★ first visible system index
   const readyRef = useRef<boolean>(false);
 
+  // UI
   const maskRef = useRef<HTMLDivElement | null>(null);
-
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
-  /* Tunables */
-  const MASK_OVERLAP = 3;          // px: hide a hair *above* next system top to prevent slur peeking
+  // Tunables
+  const MASK_OVERLAP = 4;          // px: hide slightly above next system top
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
-  /* Debounced resize recompute (wait for OSMD auto-resize to settle) */
+  // Debounced recompute (wait for OSMD auto-resize to settle)
   const raf1 = useRef<number | null>(null);
   const raf2 = useRef<number | null>(null);
   const scheduleRecompute = useCallback(() => {
@@ -142,7 +136,7 @@ export default function ScoreOSMD({
     if (raf2.current != null) cancelAnimationFrame(raf2.current);
     raf1.current = requestAnimationFrame(() => {
       raf2.current = requestAnimationFrame(() => {
-        recomputeLayoutAndPage(true); // keep position across reflow
+        recomputeLayoutAndPage(true); // keep logical position
       });
     });
   }, []);
@@ -155,7 +149,6 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  /* Apply translation + bottom mask (no top padding) */
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -170,17 +163,19 @@ export default function ScoreOSMD({
     pageRef.current = pageIdx;
 
     const startIdx = pageIdx * perPage;
+    currentStartIdxRef.current = startIdx; // ★ persist logical position
+
     const startTop = bands[startIdx]?.top ?? 0;
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    // Align so that first visible system’s top sits at viewport top (no rounding down)
+    // Align first visible system exactly to the viewport top (ceil avoids top gaps)
     const ySnap = Math.ceil(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Bottom mask hides anything starting from NEXT system’s top (minus a tiny overlap)
-    let maskTop = outer.clientHeight; // default (no extra mask)
+    // Bottom mask hides anything starting from the NEXT system’s top (with overlap)
+    let maskTop = outer.clientHeight;
     if (nextIdx < bands.length) {
       const nextTopRel = bands[nextIdx].top - startTop;
       maskTop = Math.min(
@@ -201,19 +196,14 @@ export default function ScoreOSMD({
     updateHUD();
   }, [MASK_OVERLAP, updateHUD, debug]);
 
-  /* Recompute bands + per-page. Optionally keep musical position across reflow. */
   const recomputeLayoutAndPage = useCallback((keepPosition = false) => {
     const outer = wrapRef.current;
     if (!outer) return;
 
-    // capture current aligned Y (relative to wrapper) so we can keep position
-    const prevTranslate = keepPosition ? getCurrentTranslateY(outer) : 0;
-    const prevAlignedTop = keepPosition ? Math.max(0, -prevTranslate) : 0;
-
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    // how many systems fit? (we rely on mask for the next line, so no explicit bottom pad)
+    // recompute how many systems fit vertically; we rely on the mask for peeking
     const limit = outer.clientHeight;
     let n = 0;
     for (const b of bands) {
@@ -222,21 +212,34 @@ export default function ScoreOSMD({
     }
     perPageRef.current = Math.max(1, n);
 
-    // If keeping position, choose the page so that the first visible system
-    // is the first whose top >= prevAlignedTop.
-    if (keepPosition && bands.length) {
-      let startIdx = bands.findIndex((b) => b.top >= prevAlignedTop - 0.5);
-      if (startIdx < 0) startIdx = bands.length - 1;
+    // ★ Keep the same logical start index if asked
+    if (keepPosition) {
+      let startIdx = Math.min(
+        Math.max(0, currentStartIdxRef.current),
+        Math.max(0, bands.length - 1)
+      );
       const perPage = Math.max(1, perPageRef.current);
-      const newPage = Math.floor(startIdx / perPage);
-      pageRef.current = Math.max(0, Math.min(newPage, Math.ceil(bands.length / perPage) - 1));
+      pageRef.current = Math.min(
+        Math.floor(startIdx / perPage),
+        Math.max(0, Math.ceil(bands.length / perPage) - 1)
+      );
+    } else {
+      // default to page 0 on initial load
+      pageRef.current = Math.min(pageRef.current, Math.max(0, Math.ceil(bands.length / perPageRef.current) - 1));
     }
 
     if (debug) {
       // eslint-disable-next-line no-console
-      console.table(bands.map((b, i) => ({ line: i + 1, top: b.top.toFixed(1), bottom: b.bottom.toFixed(1), height: b.height.toFixed(1) })));
+      console.table(
+        bands.map((b, i) => ({
+          line: i + 1,
+          top: b.top.toFixed(1),
+          bottom: b.bottom.toFixed(1),
+          height: b.height.toFixed(1),
+        }))
+      );
       // eslint-disable-next-line no-console
-      console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}`);
+      console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}, keep=${keepPosition}`);
     }
 
     applyTranslateForPage(pageRef.current);
@@ -256,7 +259,7 @@ export default function ScoreOSMD({
     if (p !== pageRef.current) applyTranslateForPage(p);
   }, [applyTranslateForPage]);
 
-  /* Wheel + keys */
+  // Wheel + keys
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -288,9 +291,10 @@ export default function ScoreOSMD({
     };
   }, [allowScroll, nextPage, applyTranslateForPage]);
 
-  /* Mount + OSMD load */
+  // Mount & OSMD init
   useEffect(() => {
     let localResizeObs: ResizeObserver | null = null;
+
     (async () => {
       const host = osmdHostRef.current;
       const wrapper = wrapRef.current;
@@ -300,7 +304,6 @@ export default function ScoreOSMD({
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // fresh instance
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -324,7 +327,7 @@ export default function ScoreOSMD({
 
       purgeWebGL(wrapper);
 
-      // create bottom mask once
+      // one-time bottom mask
       if (!maskRef.current && wrapper) {
         const mask = document.createElement("div");
         mask.style.position = "absolute";
@@ -340,13 +343,14 @@ export default function ScoreOSMD({
         maskRef.current = mask;
       }
 
+      currentStartIdxRef.current = 0; // start at first system
       pageRef.current = 0;
       recomputeLayoutAndPage(false);
       readyRef.current = true;
 
-      // Debounced resize observer → reflow & keep position
+      // Debounced resize observing the wrapper (OSMD auto-resizes into it)
       localResizeObs = new ResizeObserver(() => {
-        scheduleRecompute();
+        scheduleRecompute(); // keepPosition=true
       });
       localResizeObs.observe(wrapper);
       resizeObsRef.current = localResizeObs;
@@ -366,9 +370,9 @@ export default function ScoreOSMD({
       if (raf1.current != null) cancelAnimationFrame(raf1.current);
       if (raf2.current != null) cancelAnimationFrame(raf2.current);
     };
-  }, [src, scheduleRecompute, recomputeLayoutAndPage]);
+  }, [src, recomputeLayoutAndPage, scheduleRecompute]);
 
-  /* Render scaffolding */
+  // Styles
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden", background: "#fff" }
     : { width: "100%", height: height ?? 600, minHeight: height ?? 600, position: "relative", overflow: "hidden", background: "#fff" };
