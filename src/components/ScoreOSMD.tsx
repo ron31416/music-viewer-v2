@@ -1,11 +1,31 @@
-// src/components/ScoreOSMD.client.tsx
+// src/components/ScoreOSMD.tsx
 "use client";
+
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-// Returns an array of { pageIndex, systemIndex, topY, bottomY, height }
+type OSMDInstance = OpenSheetMusicDisplay & {
+  dispose?: () => void;
+  clear?: () => void;
+};
+
+type Props = {
+  /** URL to the score under /public (e.g., "/scores/gymnopedie-no-1-satie.mxl") */
+  src: string;
+  /** Fixed render height in px (OSMD needs real space). Default: 600 */
+  height?: number;
+  className?: string;
+  style?: React.CSSProperties;
+};
+
+/** Narrow Promise type check so we can "await if promise" without TS noise */
+function isPromise<T = unknown>(x: unknown): x is Promise<T> {
+  return !!x && typeof (x as any).then === "function";
+}
+
+/** Measure per-system vertical extents after render */
 function measureSystems(osmd: any) {
-  const result: Array<{ pageIndex: number; systemIndex: number; topY: number; bottomY: number; height: number }> = [];
+  const out: Array<{ pageIndex: number; systemIndex: number; topY: number; bottomY: number; height: number }> = [];
   const gms = osmd?.GraphicalMusicSheet;
   const pages = gms?.MusicPages ?? [];
   for (let p = 0; p < pages.length; p++) {
@@ -13,43 +33,24 @@ function measureSystems(osmd: any) {
     const systems = page?.MusicSystems ?? [];
     for (let s = 0; s < systems.length; s++) {
       const sys = systems[s];
-      // OSMD exposes a BoundingBox per system (logical units)
       const bb = sys?.BoundingBox ?? sys?.boundingBox;
       if (!bb) continue;
 
-      // AbsolutePosition is the top-left of the system in engraving units.
-      // The box also tracks its size; OSMD uses engraving units consistently,
-      // so relative comparisons (heights) are reliable.
       const top = bb?.AbsolutePosition?.y ?? 0;
-      const height = bb?.Size?.height ?? 0;
+      const sizeH = bb?.Size?.height ?? 0;
 
-      // Some editions have child boxes extending beyond the base height.
-      // If available, use the calculated .TopBorder/.BottomBorder as safer extremes.
-      const topBorder = (bb?.TopBorder ?? top) as number;
-      const bottomBorder = (bb?.BottomBorder ?? top + height) as number;
+      const topBorder = Number.isFinite(bb?.TopBorder) ? bb.TopBorder : top;
+      const bottomBorder = Number.isFinite(bb?.BottomBorder) ? bb.BottomBorder : top + sizeH;
 
       const topY = Math.min(top, topBorder);
-      const bottomY = Math.max(top + height, bottomBorder);
-
-      result.push({ pageIndex: p, systemIndex: s, topY, bottomY, height: bottomY - topY });
+      const bottomY = Math.max(top + sizeH, bottomBorder);
+      out.push({ pageIndex: p, systemIndex: s, topY, bottomY, height: bottomY - topY });
     }
   }
-  return result;
+  return out;
 }
 
-type OSMDInstance = OpenSheetMusicDisplay & { dispose?: () => void; clear?: () => void };
-
-export default function ScoreOSMD({
-  src,
-  height = 600,
-  className = "",
-  style,
-}: {
-  src: string;
-  height?: number;
-  className?: string;
-  style?: React.CSSProperties;
-}) {
+export default function ScoreOSMD({ src, height = 600, className = "", style }: Props) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDInstance | null>(null);
 
@@ -59,14 +60,14 @@ export default function ScoreOSMD({
     (async () => {
       if (!boxRef.current) return;
 
-      // Give OSMD real space to draw
+      // Ensure the drawing box has real space before OSMD measures layout
       boxRef.current.style.background = "#fff";
-
-      // Ensure layout is settled before rendering (fixes zero-width/hidden parents)
+      // Two RAFs help if parents are toggling visibility/layout
       await new Promise(r => requestAnimationFrame(() => r(null)));
       await new Promise(r => requestAnimationFrame(() => r(null)));
 
-      const { OpenSheetMusicDisplay } = await import("opensheetmusicdisplay");
+      // Import OSMD only on the client
+      const { OpenSheetMusicDisplay } = (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
       // Clean previous instance (dev hot-reloads / StrictMode)
       if (osmdRef.current) {
@@ -85,9 +86,47 @@ export default function ScoreOSMD({
 
       osmdRef.current = osmd;
 
-      await osmd.load(src);   // simple URL load (V1 parity)
-      if (!disposed) await osmd.render();
-    })().catch(err => console.error("OSMD load/render error:", err));
+      // --- LOAD (normalize: await only if it returns a Promise) ---
+      const maybe = (osmd as any).load(src);
+      if (isPromise(maybe)) await maybe;
+
+      // --- RENDER (typed as void in some versions; no await) ---
+      osmd.render();
+
+      // --- MEASURE & LOG per-system vertical envelope ---
+      try {
+        const systems = measureSystems(osmd as any);
+        // Console table for quick scan
+        /* eslint-disable no-console */
+        console.table(
+          systems.map(({ pageIndex, systemIndex, topY, bottomY, height }) => ({
+            page: pageIndex + 1,
+            line: systemIndex + 1,
+            topY: topY.toFixed(2),
+            bottomY: bottomY.toFixed(2),
+            height: height.toFixed(2),
+          }))
+        );
+        const tallest =
+          systems.reduce(
+            (acc, s) => (s.height > acc.height ? s : acc),
+            { pageIndex: 0, systemIndex: 0, topY: 0, bottomY: 0, height: 0 }
+          ) || null;
+        if (tallest) {
+          console.log(
+            `Tallest line → page ${tallest.pageIndex + 1}, line ${tallest.systemIndex + 1}, height ${tallest.height.toFixed(
+              2
+            )} (engraving units)`
+          );
+        }
+        /* eslint-enable no-console */
+      } catch (e) {
+        // Safe to ignore if internal shapes differ by version
+        console.warn("System measurement failed (non-fatal):", e);
+      }
+    })().catch(err => {
+      console.error("OSMD load/render error:", err);
+    });
 
     return () => {
       disposed = true;
