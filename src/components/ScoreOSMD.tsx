@@ -1,3 +1,4 @@
+// src/components/ScoreOSMD.tsx
 "use client";
 
 import { useEffect, useRef } from "react";
@@ -7,7 +8,10 @@ type OSMDInstance = OpenSheetMusicDisplay & { dispose?: () => void; clear?: () =
 
 type Props = {
   src: string;
-  height?: number;            // px, default 600
+  /** If true, container uses height:100% to fill its parent */
+  fillParent?: boolean;
+  /** Fallback fixed height in px when not filling parent (default 600) */
+  height?: number;
   className?: string;
   style?: React.CSSProperties;
 };
@@ -38,7 +42,7 @@ function analyzeBands(container: HTMLDivElement) {
       try {
         const b = g.getBBox();
         if (!isFinite(b.y) || !isFinite(b.height) || !isFinite(b.width)) continue;
-        if (b.height < 8 || b.width < 40) continue; // ignore tiny fragments
+        if (b.height < 8 || b.width < 40) continue;
         boxes.push({ y: b.y, bottom: b.y + b.height, height: b.height, width: b.width, el: g });
       } catch { /* ignore */ }
     }
@@ -83,24 +87,18 @@ function analyzeBands(container: HTMLDivElement) {
   return { bands, svgWidth };
 }
 
-/** Drop header/title band with stronger heuristic. */
-function dropHeaderIfPresent(bands: ReturnType<typeof analyzeBands>["bands"], svgWidth: number) {
-  if (bands.length < 2) return bands;
-  const [first, second] = bands;
-
-  const restHeights = bands.slice(1).map(b => b.height).sort((a,b)=>a-b);
-  const median = restHeights.length ? restHeights[Math.floor(restHeights.length/2)] : second.height;
-  const widthCov = svgWidth ? first.maxWidth / svgWidth : 1;
-
-  const looksLikeHeader =
-    first.verticalLines <= 1 &&
-    (first.height > median * 1.3 || first.height > 80) &&
-    widthCov < 0.9;
-
-  return looksLikeHeader ? bands.slice(1) : bands;
+/** Keep title inside line 1 (as you want) → no header drop here */
+function keepAllBands(bands: ReturnType<typeof analyzeBands>["bands"]) {
+  return bands;
 }
 
-export default function ScoreOSMD({ src, height = 600, className = "", style }: Props) {
+export default function ScoreOSMD({
+  src,
+  fillParent = false,
+  height = 600,
+  className = "",
+  style,
+}: Props) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDInstance | null>(null);
 
@@ -108,7 +106,6 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
   const moRef = useRef<MutationObserver | null>(null);
   const debounceTimer = useRef<number | null>(null);
 
-  // debounced measurement triggered by DOM mutations (OSMD reflow)
   const scheduleMeasure = () => {
     if (debounceTimer.current) {
       window.clearTimeout(debounceTimer.current);
@@ -117,17 +114,13 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
     debounceTimer.current = window.setTimeout(() => {
       if (!boxRef.current) return;
       const { bands, svgWidth } = analyzeBands(boxRef.current);
-      const systems = dropHeaderIfPresent(bands, svgWidth);
+      const systems = keepAllBands(bands); // include title within line 1
 
-      // dedupe identical output
-      const sig = `${systems.length}|${systems.map(s=>s.height.toFixed(1)).join(",")}`;
+      const sig = `${systems.length}|${systems.map(s=>s.height.toFixed(1)).join(",")}|${Math.round(svgWidth)}`;
       if (sig === lastSigRef.current) return;
       lastSigRef.current = sig;
 
-      if (!systems.length) {
-        console.warn("No systems detected during measurement.");
-        return;
-      }
+      if (!systems.length) return;
       console.table(
         systems.map((s,i)=>({
           line: i+1,
@@ -138,7 +131,7 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       );
       const tallest = systems.reduce((a,b)=> b.height>a.height ? b : a, systems[0]);
       console.log(`Tallest line → line ${systems.indexOf(tallest)+1}, height ${tallest.height.toFixed(1)} px`);
-    }, 120); // small debounce so we run after OSMD finishes DOM updates
+    }, 120);
   };
 
   useEffect(() => {
@@ -152,7 +145,6 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // cleanup previous
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -160,7 +152,7 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       }
 
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
-        autoResize: true, // OSMD reflows on width changes
+        autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
         drawComposer: true,
@@ -172,22 +164,10 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
       if (isPromise(maybe)) await maybe;
       osmd.render();
 
-      // Observe the SVG subtree for **actual DOM changes** (child/attr/text)
       if (!moRef.current) {
-        moRef.current = new MutationObserver(() => {
-          // Any DOM change in the SVG subtree will land here; measure once debounced
-          scheduleMeasure();
-        });
+        moRef.current = new MutationObserver(() => scheduleMeasure());
       }
-      // Attach observer to container (subtree: true so it catches SVG replacements)
-      moRef.current.observe(boxRef.current, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-        characterData: false
-      });
-
-      // Kick an initial measurement after first paint
+      moRef.current.observe(boxRef.current, { subtree: true, childList: true, attributes: true });
       scheduleMeasure();
     })().catch(err => {
       console.error("OSMD load/render error:", err);
@@ -210,11 +190,18 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
     };
   }, [src]);
 
+  // Container sizing:
+  // - If fillParent: take 100% of parent height
+  // - Else: fixed pixel height
+  const containerStyle: React.CSSProperties = fillParent
+    ? { width: "100%", height: "100%", minHeight: 0, overflow: "auto" }
+    : { width: "100%", height, minHeight: height, overflow: "auto" };
+
   return (
     <div
       ref={boxRef}
       className={className}
-      style={{ width: "100%", minHeight: height, height, overflow: "auto", ...style }}
+      style={{ ...containerStyle, ...style }}
     />
   );
 }
