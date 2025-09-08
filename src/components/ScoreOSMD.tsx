@@ -1,10 +1,9 @@
-// src/components/ScoreOSMD.tsx
 "use client";
 
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* --------- minimal structural types (no `any`) --------- */
+/* --- minimal shapes (no any) --- */
 interface SourceMeasure { MeasureNumber?: number }
 interface GraphicalMeasure {
   SourceMeasure?: SourceMeasure;
@@ -12,14 +11,8 @@ interface GraphicalMeasure {
   Parent?: { SourceMeasure?: SourceMeasure };
   MeasureNumber?: number;
 }
-interface StaffLine {
-  Measures?: GraphicalMeasure[];
-  measures?: GraphicalMeasure[];
-}
-interface MusicSystem {
-  StaffLines?: StaffLine[];
-  staffLines?: StaffLine[];
-}
+interface StaffLine { Measures?: GraphicalMeasure[]; measures?: GraphicalMeasure[] }
+interface MusicSystem { StaffLines?: StaffLine[]; staffLines?: StaffLine[] }
 interface MusicPage { MusicSystems?: MusicSystem[] }
 interface GraphicalMusicSheet { MusicPages?: MusicPage[] }
 
@@ -30,52 +23,46 @@ type OSMDInstance = OpenSheetMusicDisplay & {
 };
 
 type Props = {
-  src: string;                 // e.g. "/scores/gymnopedie-no-1-satie.mxl"
-  fillParent?: boolean;        // height:100% if true
-  height?: number;             // px when not filling parent (default 600)
-  debug?: boolean;             // console tables
+  src: string;
+  fillParent?: boolean;
+  height?: number;
+  debug?: boolean;
   className?: string;
   style?: React.CSSProperties;
 };
 
-function isPromise<T = unknown>(x: unknown): x is Promise<T> {
+function isPromise<T=unknown>(x:unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
-function afterPaint(): Promise<void> {
-  return new Promise(res => requestAnimationFrame(() => requestAnimationFrame(() => res())));
+function afterPaint() {
+  return new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 }
 
-/* belt-and-suspenders: nuke any WebGL contexts that might appear */
+/* belt & suspenders: kill any WebGL canvases */
 function purgeWebGL(node: HTMLElement) {
-  const canvases = Array.from(node.querySelectorAll("canvas"));
-  for (const c of canvases) {
+  for (const c of Array.from(node.querySelectorAll("canvas"))) {
     try {
-      const gl =
-        (c.getContext("webgl") as WebGLRenderingContext | null) ||
-        (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
-        (c.getContext("webgl2") as WebGL2RenderingContext | null);
-      if (gl) gl.getExtension("WEBGL_lose_context")?.loseContext?.();
+      const gl = (c.getContext("webgl") as WebGLRenderingContext|null)
+              || (c.getContext("experimental-webgl") as WebGLRenderingContext|null)
+              || (c.getContext("webgl2") as WebGL2RenderingContext|null);
+      gl?.getExtension("WEBGL_lose_context")?.loseContext?.();
       c.remove();
     } catch {}
   }
 }
 
-/* ---- DOM measurement of systems (“bands”) ---- */
-type Band = { top: number; bottom: number; height: number };
+/* DOM measurement of systems */
+type Band = { top:number; bottom:number; height:number };
 function analyzeBands(container: HTMLDivElement): Band[] {
   const svg = container.querySelector("svg");
   if (!svg) return [];
-
   const pageRoots = Array.from(
-    svg.querySelectorAll<SVGGElement>(
-      'g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]'
-    )
+    svg.querySelectorAll<SVGGElement>('g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]')
   );
-  const roots: Array<SVGGElement | SVGSVGElement> = pageRoots.length ? pageRoots : [svg];
+  const roots: Array<SVGGElement|SVGSVGElement> = pageRoots.length ? pageRoots : [svg];
 
-  type Box = { y: number; bottom: number; height: number; width: number };
+  type Box = { y:number; bottom:number; height:number; width:number };
   const boxes: Box[] = [];
-
   for (const root of roots) {
     for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
       try {
@@ -86,15 +73,14 @@ function analyzeBands(container: HTMLDivElement): Band[] {
       } catch {}
     }
   }
+  boxes.sort((a,b)=>a.y-b.y);
 
-  boxes.sort((a, b) => a.y - b.y);
-
-  const GAP = 24; // px between systems
+  const GAP = 24;
   const bands: Band[] = [];
   for (const b of boxes) {
-    const last = bands[bands.length - 1];
+    const last = bands[bands.length-1];
     if (!last || b.y - last.bottom > GAP) {
-      bands.push({ top: b.y, bottom: b.bottom, height: b.height });
+      bands.push({ top:b.y, bottom:b.bottom, height:b.height });
     } else {
       if (b.y < last.top) last.top = b.y;
       if (b.bottom > last.bottom) last.bottom = b.bottom;
@@ -104,35 +90,29 @@ function analyzeBands(container: HTMLDivElement): Band[] {
   return bands;
 }
 
-/* how many systems fit fully (by bottom edge) */
-function linesPerPage(bands: Band[], container: HTMLDivElement, padPx: number): number {
+function linesPerPage(bands: Band[], container: HTMLDivElement, padPx:number) {
   const limit = container.clientHeight - padPx;
   let count = 0;
   for (const b of bands) {
-    if (b.bottom <= limit) count += 1;
+    if (b.bottom <= limit) count++;
     else break;
   }
   return Math.max(1, count);
 }
 
-/* ------------ FULL-LAYOUT mapping: system index -> last measure number (for ALL pages) ----------- */
-function buildSystemMeasureEnds(osmd: OSMDInstance): number[] {
-  const ends: number[] = [];
-  const gms = osmd.GraphicalMusicSheet;
-  const pages: MusicPage[] = gms?.MusicPages ?? [];
-  for (const page of pages) {
-    const systems: MusicSystem[] = page.MusicSystems ?? [];
-    for (const sys of systems) {
-      const lines: StaffLine[] = (sys.StaffLines ?? sys.staffLines) ?? [];
+/* full-layout stable mapping: system index -> last measure number */
+function buildSystemEnds(osmd: OSMDInstance): number[] {
+  const ends:number[] = [];
+  const pages = osmd.GraphicalMusicSheet?.MusicPages ?? [];
+  for (const p of pages) {
+    for (const sys of (p.MusicSystems ?? [])) {
       let best = 0;
-      for (const sl of lines) {
-        const measures: GraphicalMeasure[] = (sl.Measures ?? sl.measures) ?? [];
-        for (const m of measures) {
-          const n =
-            m.SourceMeasure?.MeasureNumber ??
-            m.ParentMeasure?.SourceMeasure?.MeasureNumber ??
-            m.Parent?.SourceMeasure?.MeasureNumber ??
-            m.MeasureNumber ?? 0;
+      for (const sl of ((sys.StaffLines ?? sys.staffLines) ?? [])) {
+        for (const m of ((sl.Measures ?? sl.measures) ?? [])) {
+          const n = m.SourceMeasure?.MeasureNumber
+                 ?? m.ParentMeasure?.SourceMeasure?.MeasureNumber
+                 ?? m.Parent?.SourceMeasure?.MeasureNumber
+                 ?? m.MeasureNumber ?? 0;
           if (n > best) best = n;
         }
       }
@@ -142,10 +122,9 @@ function buildSystemMeasureEnds(osmd: OSMDInstance): number[] {
   return ends;
 }
 
-/* narrow options type for setOptions */
-type MeasureSliceOptions = { drawFromMeasureNumber?: number; drawUpToMeasureNumber?: number; };
-function setMeasureOptions(osmd: OSMDInstance, opts: MeasureSliceOptions) {
-  (osmd as unknown as { setOptions: (o: MeasureSliceOptions) => void }).setOptions(opts);
+type MeasureSliceOptions = { drawFromMeasureNumber?: number; drawUpToMeasureNumber?: number };
+function setMeasureOptions(osmd: OSMDInstance, o: MeasureSliceOptions) {
+  (osmd as unknown as { setOptions:(o:MeasureSliceOptions)=>void }).setOptions(o);
 }
 
 export default function ScoreOSMD({
@@ -154,42 +133,40 @@ export default function ScoreOSMD({
   height = 600,
   debug = false,
   className = "",
-  style,
+  style
 }: Props) {
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  const osmdRef = useRef<OSMDInstance | null>(null);
+  const boxRef = useRef<HTMLDivElement|null>(null);
+  const osmdRef = useRef<OSMDInstance|null>(null);
+  const resizeObsRef = useRef<ResizeObserver|null>(null);
+  const debounceRef = useRef<number|null>(null);
 
-  const resizeObsRef = useRef<ResizeObserver | null>(null);
-  const debounceTimer = useRef<number | null>(null);
+  // paging state
+  const systemEndsRef = useRef<number[]>([]);
+  const startSystemRef = useRef(0);
+  const nLinesRef = useRef(1);
+  const currentRangeRef = useRef<{from:number; upTo:number}>({from:0, upTo:0});
+  const recomputingRef = useRef(false);
 
-  // Paging state & cached mapping
-  const startSystemRef = useRef<number>(0);
-  const linesPerPageRef = useRef<number>(1);
-  const systemEndsRef = useRef<number[]>([]); // system k -> last measure number
-  const currentRangeRef = useRef<{ from: number; upTo: number }>({ from: 0, upTo: 0 });
-  const recomputingRef = useRef<boolean>(false);
+  const FIT_PAD = 24;            // bigger safety pad
+  const VALIDATE_MAX = 5;        // more retries
+  const WHEEL_THROTTLE_MS = 160;
+  const wheelLockRef = useRef(0);
 
-  const FIT_PAD_PX = 16;
-  const VALIDATE_MAX_STEPS = 3;
-  const WHEEL_COOLDOWN_MS = 180;
-  const wheelLockRef = useRef<number>(0);
-
-  /* render a page: systems [start .. start + n - 1], using PRECOMPUTED systemEndsRef */
-  const renderPage = async (start: number, n: number) => {
-    const container = boxRef.current;
-    const osmd = osmdRef.current;
+  async function renderPage(start:number, n:number) {
+    const container = boxRef.current!;
+    const osmd = osmdRef.current!;
     const ends = systemEndsRef.current;
-    if (!container || !osmd || ends.length === 0) return;
+    if (!ends.length) return;
 
-    const totalSystems = ends.length;
-    const lastStart = Math.max(0, totalSystems - n);
+    const total = ends.length;
+    const lastStart = Math.max(0, total - n);
     const s = Math.min(Math.max(0, start), lastStart);
-    const endIndex = Math.min(totalSystems - 1, s + n - 1);
+    const endIdx = Math.min(total - 1, s + n - 1);
 
-    const upTo = ends[endIndex];
+    const upTo = ends[endIdx];
     const from = s === 0 ? 1 : ends[s - 1] + 1;
 
-    // Only re-render if the measure range actually changes
+    // FIX: re-render when EITHER bound changes
     if (currentRangeRef.current.from !== from || currentRangeRef.current.upTo !== upTo) {
       setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
       osmd.render();
@@ -197,18 +174,17 @@ export default function ScoreOSMD({
       await afterPaint();
     }
 
-    // Post-slice validation: drop one system if the last still “peeks”
-    let steps = 0;
-    while (steps < VALIDATE_MAX_STEPS) {
+    // validate (drop one line if still peeking)
+    let tries = 0;
+    while (tries < VALIDATE_MAX) {
       const bands = analyzeBands(container);
-      const limit = container.clientHeight - FIT_PAD_PX;
+      const limit = container.clientHeight - FIT_PAD;
       const lastBand = bands[bands.length - 1];
       if (!lastBand || lastBand.bottom <= limit) break;
 
-      if (n <= 1) break; // cannot shrink further
+      if (n <= 1) break;
       n -= 1;
-
-      const newEndIdx = Math.min(totalSystems - 1, s + n - 1);
+      const newEndIdx = Math.min(total - 1, s + n - 1);
       const newUpTo = ends[newEndIdx];
       const newFrom = s === 0 ? 1 : ends[s - 1] + 1;
 
@@ -218,20 +194,18 @@ export default function ScoreOSMD({
       osmd.render();
       currentRangeRef.current = { from: newFrom, upTo: newUpTo };
       await afterPaint();
-
-      steps += 1;
+      tries++;
     }
 
     startSystemRef.current = s;
-  };
+  }
 
-  /* Full recompute on size change: full render → build mapping → measure -> decide N -> render page */
-  const scheduleRecompute = () => {
-    if (debounceTimer.current) {
-      window.clearTimeout(debounceTimer.current);
-      debounceTimer.current = null;
+  function scheduleRecompute() {
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
     }
-    debounceTimer.current = window.setTimeout(async () => {
+    debounceRef.current = window.setTimeout(async () => {
       const container = boxRef.current;
       const osmd = osmdRef.current;
       if (!container || !osmd) return;
@@ -241,45 +215,41 @@ export default function ScoreOSMD({
       try {
         purgeWebGL(container);
 
-        // 1) FULL render (clear any previous slice)
+        // full render
         setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: Number.MAX_SAFE_INTEGER });
         osmd.render();
         await afterPaint();
 
-        // 2) Build a STABLE system→lastMeasure mapping for the entire score
-        systemEndsRef.current = buildSystemMeasureEnds(osmd);
+        // stable system map
+        systemEndsRef.current = buildSystemEnds(osmd);
 
-        // 3) DOM-measure page to decide how many lines fit
+        // decide lines per page
         const bands = analyzeBands(container);
-        const n = linesPerPage(bands, container, FIT_PAD_PX);
-        linesPerPageRef.current = n;
+        const n = linesPerPage(bands, container, FIT_PAD);
+        nLinesRef.current = n;
 
         if (debug) {
           // eslint-disable-next-line no-console
-          console.table(bands.map((b, i) => ({
-            line: i + 1, top: b.top.toFixed(1), bottom: b.bottom.toFixed(1), height: b.height.toFixed(1),
-          })));
+          console.table(bands.map((b,i)=>({line:i+1, top:b.top.toFixed(1), bottom:b.bottom.toFixed(1), height:b.height.toFixed(1)})));
           // eslint-disable-next-line no-console
-          console.log(`linesPerPage = ${n}, totalSystems = ${systemEndsRef.current.length}, startSystem = ${startSystemRef.current}`);
+          console.log(`linesPerPage=${n}, totalSystems=${systemEndsRef.current.length}, startSystem=${startSystemRef.current}`);
         }
 
-        // 4) Clamp current start index under new totals
-        const total = systemEndsRef.current.length;
-        const lastStart = Math.max(0, total - n);
+        // clamp start under new totals
+        const lastStart = Math.max(0, systemEndsRef.current.length - n);
         if (startSystemRef.current > lastStart) startSystemRef.current = lastStart;
 
-        // 5) Render that page
         await renderPage(startSystemRef.current, n);
+        purgeWebGL(container);
       } finally {
         recomputingRef.current = false;
       }
-    }, 120);
-  };
+    }, 100);
+  }
 
-  /* Page forward/back by a full set of lines */
-  const changePage = async (deltaPages: number) => {
+  async function changePage(deltaPages:number) {
     const total = systemEndsRef.current.length;
-    const n = Math.max(1, linesPerPageRef.current);
+    const n = Math.max(1, nLinesRef.current);
     if (!total) return;
 
     const lastStart = Math.max(0, total - n);
@@ -290,44 +260,38 @@ export default function ScoreOSMD({
     if (nextStart !== startSystemRef.current) {
       await renderPage(nextStart, n);
     }
-  };
+  }
 
-  // Wheel / keyboard paging (no vertical scroll)
+  // wheel / key handlers
   useEffect(() => {
-    const container = boxRef.current;
-    if (!container) return;
+    const el = boxRef.current;
+    if (!el) return;
 
     const onWheel = (e: WheelEvent) => {
-      // Only vertical intent
       if (Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
       e.preventDefault();
-
       const now = Date.now();
-      if (now < wheelLockRef.current) return; // throttle bursts
-      wheelLockRef.current = now + WHEEL_COOLDOWN_MS;
-
+      if (now < wheelLockRef.current) return;
+      wheelLockRef.current = now + WHEEL_THROTTLE_MS;
       void changePage(e.deltaY > 0 ? 1 : -1);
     };
-
     const onKey = (e: KeyboardEvent) => {
-      if (["PageDown", "ArrowDown", " "].includes(e.key)) {
-        e.preventDefault();
-        void changePage(1);
-      } else if (["PageUp", "ArrowUp"].includes(e.key)) {
-        e.preventDefault();
-        void changePage(-1);
-      }
+      if (["PageDown","ArrowDown"," "].includes(e.key)) { e.preventDefault(); void changePage(1); }
+      else if (["PageUp","ArrowUp"].includes(e.key)) { e.preventDefault(); void changePage(-1); }
     };
 
-    container.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("wheel", onWheel, { passive:false });
     window.addEventListener("keydown", onKey);
+    // focus once so keys work immediately
+    el.tabIndex = 0; el.focus();
+
     return () => {
-      container.removeEventListener("wheel", onWheel);
+      el.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // mount / load
   useEffect(() => {
     (async () => {
       if (!boxRef.current) return;
@@ -336,14 +300,10 @@ export default function ScoreOSMD({
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      if (osmdRef.current) {
-        osmdRef.current.clear?.();
-        osmdRef.current.dispose?.();
-        osmdRef.current = null;
-      }
+      if (osmdRef.current) { osmdRef.current.clear?.(); osmdRef.current.dispose?.(); osmdRef.current = null; }
 
       const osmd = new OpenSheetMusicDisplay(boxRef.current, {
-        backend: "svg" as const, // force SVG backend
+        backend: "svg" as const,   // force SVG
         autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
@@ -355,50 +315,29 @@ export default function ScoreOSMD({
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
       osmd.render();
-      startSystemRef.current = 0;
-      currentRangeRef.current = { from: 0, upTo: 0 };
 
-      // Initial compute/page
+      // initial compute/page
+      startSystemRef.current = 0;
+      currentRangeRef.current = { from:0, upTo:0 };
       scheduleRecompute();
 
-      // React to BOTH width and height changes
       if (!resizeObsRef.current) {
         resizeObsRef.current = new ResizeObserver(() => scheduleRecompute());
-        resizeObsRef.current.observe(boxRef.current);
+        resizeObsRef?.current?.observe(boxRef.current!);
       }
-    })().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("OSMD init error:", err);
-    });
+    })().catch(err => { console.error("OSMD init error:", err); });
 
     return () => {
-      if (debounceTimer.current) {
-        window.clearTimeout(debounceTimer.current);
-        debounceTimer.current = null;
-      }
-      if (resizeObsRef.current && boxRef.current) {
-        resizeObsRef.current.unobserve(boxRef.current);
-      }
+      if (debounceRef.current) { window.clearTimeout(debounceRef.current); debounceRef.current = null; }
+      if (resizeObsRef.current && boxRef.current) resizeObsRef.current.unobserve(boxRef.current);
       resizeObsRef.current = null;
-      if (osmdRef.current) {
-        osmdRef.current.clear?.();
-        osmdRef.current.dispose?.();
-        osmdRef.current = null;
-      }
+      if (osmdRef.current) { osmdRef.current.clear?.(); osmdRef.current.dispose?.(); osmdRef.current = null; }
     };
   }, [src]);
 
-  // Container: NO vertical scrollbar (we page instead of scrolling)
   const containerStyle: React.CSSProperties = fillParent
-    ? { width: "100%", height: "100%", minHeight: 0, overflowY: "hidden", overflowX: "hidden" }
-    : { width: "100%", height, minHeight: height, overflowY: "hidden", overflowX: "hidden" };
+    ? { width:"100%", height:"100%", minHeight:0, overflowY:"hidden", overflowX:"hidden" }
+    : { width:"100%", height: height ?? 600, minHeight: height ?? 600, overflowY:"hidden", overflowX:"hidden" };
 
-  return (
-    <div
-      ref={boxRef}
-      className={`osmd-container ${className || ""}`}
-      style={{ background: "#fff", ...containerStyle, ...style }}
-      tabIndex={0}
-    />
-  );
+  return <div ref={boxRef} className={`osmd-container ${className || ""}`} style={{ background:"#fff", ...containerStyle, ...style }} />;
 }
