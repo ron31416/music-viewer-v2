@@ -1,4 +1,3 @@
-// src/components/ScoreOSMD.tsx
 "use client";
 
 import { useEffect, useRef } from "react";
@@ -36,6 +35,8 @@ type Props = {
   fillParent?: boolean;
   /** Fallback fixed height in px when not filling parent (default 600) */
   height?: number;
+  /** Log measurements to console on each recompute */
+  debug?: boolean;
   className?: string;
   style?: React.CSSProperties;
 };
@@ -50,6 +51,29 @@ function afterPaint(): Promise<void> {
   return new Promise((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
   );
+}
+
+/* Explicitly kill any WebGL contexts inside a node (paranoid cleanup) */
+function purgeWebGL(node: HTMLElement) {
+  const canvases = Array.from(node.querySelectorAll("canvas"));
+  for (const c of canvases) {
+    try {
+      const gl =
+        (c.getContext("webgl") as WebGLRenderingContext | null) ||
+        (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
+        (c.getContext("webgl2") as WebGL2RenderingContext | null);
+      if (gl) {
+        const lose = gl.getExtension("WEBGL_lose_context");
+        if (lose && typeof lose.loseContext === "function") {
+          lose.loseContext();
+        }
+      }
+      // Remove the canvas to ensure the context is GC'ed
+      if (c.parentNode) c.parentNode.removeChild(c);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /* Measure vertical bands (systems) from rendered SVG */
@@ -101,9 +125,10 @@ function analyzeBands(container: HTMLDivElement) {
 /* Index of last fully visible system that fits in container height */
 function computeLastFullyVisibleIndex(
   systems: Array<{ top: number; bottom: number; height: number }>,
-  container: HTMLDivElement
+  container: HTMLDivElement,
+  safetyPadPx: number
 ) {
-  const maxH = container.clientHeight;
+  const maxH = container.clientHeight - safetyPadPx; // <- subtract margin to avoid peeking
   let sum = 0;
   for (let i = 0; i < systems.length; i++) {
     const h = Math.max(0, systems[i].height);
@@ -153,6 +178,7 @@ export default function ScoreOSMD({
   src,
   fillParent = false,
   height = 600,
+  debug = false,
   className = "",
   style,
 }: Props) {
@@ -163,6 +189,9 @@ export default function ScoreOSMD({
   const debounceTimer = useRef<number | null>(null);
   const recomputingRef = useRef<boolean>(false);
   const currentUpToRef = useRef<number>(0);
+
+  // Small margin to prevent “peek” of next system (slurs/phrases)
+  const FIT_PAD_PX = 8;
 
   // Debounced recompute driven by WIDTH changes (and initial load)
   const scheduleRecompute = () => {
@@ -181,6 +210,9 @@ export default function ScoreOSMD({
         // Preserve scroll position so the view doesn't jump
         const prevScrollTop = container.scrollTop;
 
+        // Paranoid: clear any stray WebGL canvases before rendering
+        purgeWebGL(container);
+
         // Phase 1: full render (remove slice)
         setMeasureOptions(osmd, {
           drawFromMeasureNumber: 1,
@@ -196,8 +228,24 @@ export default function ScoreOSMD({
           return;
         }
 
-        // Decide how many lines fit fully (at least 1)
-        const lastIdx = Math.max(0, computeLastFullyVisibleIndex(systems, container));
+        // (Optional) debug output
+        if (debug) {
+          // eslint-disable-next-line no-console
+          console.table(
+            systems.map((s, i) => ({
+              line: i + 1,
+              top: s.top.toFixed(1),
+              bottom: s.bottom.toFixed(1),
+              height: s.height.toFixed(1),
+            }))
+          );
+        }
+
+        // Decide how many lines fit fully (at least 1), with safety pad
+        const lastIdx = Math.max(
+          0,
+          computeLastFullyVisibleIndex(systems, container, FIT_PAD_PX)
+        );
 
         // Map that system to its last measure number
         const upToMeasure = getLastMeasureNumberForSystem(osmd, lastIdx);
@@ -215,6 +263,9 @@ export default function ScoreOSMD({
 
         // Restore scrollTop (prevents bouncing to top)
         container.scrollTop = prevScrollTop;
+
+        // Paranoid again after render
+        purgeWebGL(container);
       } finally {
         recomputingRef.current = false;
       }
@@ -269,7 +320,7 @@ export default function ScoreOSMD({
       console.error("OSMD init error:", err);
     });
 
-    return () => {
+  return () => {
       if (debounceTimer.current) {
         window.clearTimeout(debounceTimer.current);
         debounceTimer.current = null;
