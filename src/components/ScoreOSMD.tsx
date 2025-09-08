@@ -11,6 +11,19 @@ type ScoreOSMDProps = {
   style?: React.CSSProperties;
 };
 
+type OSMDCompat = OpenSheetMusicDisplay & {
+  /** Older OSMD runtime uses capitalized Zoom */
+  Zoom?: number;
+  /** Future/variant runtime might expose lowercase zoom */
+  zoom?: number;
+};
+
+function setOsmdZoom(osmd: OpenSheetMusicDisplay, z: number) {
+  const o = osmd as OSMDCompat;
+  if (typeof o.Zoom === "number") o.Zoom = z;
+  else if (typeof o.zoom === "number") o.zoom = z;
+}
+
 export default function ScoreOSMD({
   src,
   zoom = 1,
@@ -22,28 +35,21 @@ export default function ScoreOSMD({
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
   const [localZoom, setLocalZoom] = useState(zoom);
   const [status, setStatus] = useState<string>("idle");
-  const [box, setBox] = useState<{w:number;h:number}>({w:0,h:0});
+  const [box, setBox] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
   useEffect(() => setLocalZoom(zoom), [zoom]);
 
-  const applyZoom = (z: number) => {
-    const anyOsmd: any = osmdRef.current;
-    if (!anyOsmd) return;
-    try { anyOsmd.Zoom = z; } catch {}
-    try { anyOsmd.zoom = z; } catch {}
-  };
-
-  // Wait until the container has a real size (fixes dialog/tab zero-width renders)
-  const waitForBox = async () => {
+  // Wait until the container has non-zero size (dialogs/tabs can start at 0)
+  const waitForBox = async (): Promise<boolean> => {
     const el = containerRef.current;
     if (!el) return false;
     let tries = 0;
-    while (tries < 12) { // ~12 frames ≈ 200ms
+    while (tries < 12) {
       const w = el.offsetWidth;
       const h = el.offsetHeight;
       setBox({ w, h });
       if (w > 0 && h > 0) return true;
-      await new Promise(r => requestAnimationFrame(() => r(null)));
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
       tries++;
     }
     return el.offsetWidth > 0 && el.offsetHeight > 0;
@@ -53,60 +59,60 @@ export default function ScoreOSMD({
     let cancelled = false;
 
     const run = async () => {
-      if (!containerRef.current || !src) return;
+      if (!containerRef.current) return;
 
       setStatus("checking src…");
-      // Optional prefetch so we can surface 404s clearly
       try {
         const resp = await fetch(src, { method: "GET" });
         if (!resp.ok) {
           setStatus(`file error ${resp.status} (${resp.statusText})`);
           return;
         }
-      } catch (e) {
+      } catch {
         setStatus("network error");
         return;
       }
 
       setStatus("waiting for layout…");
       const sized = await waitForBox();
-      if (!sized) {
-        setStatus("container is size 0 — check parent sizing");
+      if (!sized || cancelled) {
+        if (!sized) setStatus("container is size 0 — check parent sizing");
         return;
       }
-      if (cancelled) return;
 
       try {
         if (!osmdRef.current) {
-          osmdRef.current = new OpenSheetMusicDisplay(containerRef.current!, {
+          osmdRef.current = new OpenSheetMusicDisplay(containerRef.current, {
             autoResize: false,
             backend: "svg",
             drawTitle: false,
           });
         }
         const osmd = osmdRef.current;
+
         setStatus("loading…");
         await osmd.load(src);
-
         if (cancelled) return;
-        applyZoom(localZoom);
 
-        // Render on next frame to ensure final layout
-        await new Promise(r => requestAnimationFrame(() => r(null)));
+        setOsmdZoom(osmd, localZoom);
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+
         setStatus("rendering…");
         await osmd.render();
         setStatus("rendered");
-      } catch (err) {
+      } catch (err: unknown) {
         console.error("[ScoreOSMD] load/render failed:", err);
         setStatus("error (see console)");
       }
     };
 
     run();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [src, localZoom]);
 
-  // Re-render when the box resizes (dialogs/tabs opening, window resizes, etc.)
+  // Re-render when the box size changes (dialog opens, window resizes, etc.)
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -114,16 +120,24 @@ export default function ScoreOSMD({
       setBox({ w: el.offsetWidth, h: el.offsetHeight });
       const osmd = osmdRef.current;
       if (!osmd) return;
-      try { osmd.render(); } catch {}
+      try {
+        osmd.render();
+      } catch {
+        /* noop */
+      }
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  // Cleanup on unmount
+  // Cleanup
   useEffect(() => {
     return () => {
-      try { osmdRef.current?.clear(); } catch {}
+      try {
+        osmdRef.current?.clear();
+      } catch {
+        /* noop */
+      }
       osmdRef.current = null;
     };
   }, []);
@@ -132,16 +146,34 @@ export default function ScoreOSMD({
     <div className={className} style={style}>
       {showControls && (
         <div className="flex items-center gap-2 mb-2" aria-label="score zoom controls">
-          <button type="button" className="px-2 py-1 rounded border"
-            onClick={() => setLocalZoom((z) => Number(Math.max(0.1, z - 0.1).toFixed(2)))}
-          >−</button>
-          <span className="tabular-nums w-[5ch] text-center">{(localZoom * 100).toFixed(0)}%</span>
-          <button type="button" className="px-2 py-1 rounded border"
+          <button
+            type="button"
+            className="px-2 py-1 rounded border"
+            onClick={() =>
+              setLocalZoom((z) => Number(Math.max(0.1, z - 0.1).toFixed(2)))
+            }
+          >
+            −
+          </button>
+          <span className="tabular-nums w-[5ch] text-center">
+            {(localZoom * 100).toFixed(0)}%
+          </span>
+          <button
+            type="button"
+            className="px-2 py-1 rounded border"
             onClick={() => setLocalZoom((z) => Number((z + 0.1).toFixed(2)))}
-          >+</button>
-          <button type="button" className="px-2 py-1 rounded border" onClick={() => setLocalZoom(1)}>Reset</button>
+          >
+            +
+          </button>
+          <button
+            type="button"
+            className="px-2 py-1 rounded border"
+            onClick={() => setLocalZoom(1)}
+          >
+            Reset
+          </button>
           <span className="ml-3 text-sm opacity-70">
-            Status: {status} {box.w>0 && `• ${box.w}×${box.h}`} • {src}
+            Status: {status} {box.w > 0 && `• ${box.w}×${box.h}`} • {src}
           </span>
         </div>
       )}
