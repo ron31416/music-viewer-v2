@@ -3,6 +3,40 @@
 import { useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
+// Returns an array of { pageIndex, systemIndex, topY, bottomY, height }
+function measureSystems(osmd: any) {
+  const result: Array<{ pageIndex: number; systemIndex: number; topY: number; bottomY: number; height: number }> = [];
+  const gms = osmd?.GraphicalMusicSheet;
+  const pages = gms?.MusicPages ?? [];
+  for (let p = 0; p < pages.length; p++) {
+    const page = pages[p];
+    const systems = page?.MusicSystems ?? [];
+    for (let s = 0; s < systems.length; s++) {
+      const sys = systems[s];
+      // OSMD exposes a BoundingBox per system (logical units)
+      const bb = sys?.BoundingBox ?? sys?.boundingBox;
+      if (!bb) continue;
+
+      // AbsolutePosition is the top-left of the system in engraving units.
+      // The box also tracks its size; OSMD uses engraving units consistently,
+      // so relative comparisons (heights) are reliable.
+      const top = bb?.AbsolutePosition?.y ?? 0;
+      const height = bb?.Size?.height ?? 0;
+
+      // Some editions have child boxes extending beyond the base height.
+      // If available, use the calculated .TopBorder/.BottomBorder as safer extremes.
+      const topBorder = (bb?.TopBorder ?? top) as number;
+      const bottomBorder = (bb?.BottomBorder ?? top + height) as number;
+
+      const topY = Math.min(top, topBorder);
+      const bottomY = Math.max(top + height, bottomBorder);
+
+      result.push({ pageIndex: p, systemIndex: s, topY, bottomY, height: bottomY - topY });
+    }
+  }
+  return result;
+}
+
 type OSMDInstance = OpenSheetMusicDisplay & { dispose?: () => void; clear?: () => void };
 
 export default function ScoreOSMD({
