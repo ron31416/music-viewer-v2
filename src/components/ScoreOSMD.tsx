@@ -6,8 +6,8 @@ import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 type OSMDInstance = OpenSheetMusicDisplay & { dispose?: () => void; clear?: () => void };
 
 type Props = {
-  src: string;                 // e.g. "/scores/gymnopedie-no-1-satie.mxl"
-  height?: number;             // px, default 600
+  src: string;
+  height?: number;            // px, default 600
   className?: string;
   style?: React.CSSProperties;
 };
@@ -16,60 +16,103 @@ function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
 
-/** Cluster <g> boxes vertically; also keep each band's max width. */
-function measureBands(container: HTMLDivElement) {
+/** Cluster <g> boxes vertically; compute band features for filtering. */
+function analyzeBands(container: HTMLDivElement) {
   const svg = container.querySelector("svg");
-  if (!svg) return [] as Array<{ top: number; bottom: number; height: number; maxWidth: number }>;
+  if (!svg) return { bands: [] as Band[], svgWidth: 0 };
 
-  const pageGroups = Array.from(
+  type Box = { y: number; bottom: number; height: number; width: number; el: SVGGElement | SVGGraphicsElement };
+  type Band = { top: number; bottom: number; height: number; maxWidth: number; verticalLines: number };
+
+  const pageRoots = Array.from(
     svg.querySelectorAll<SVGGElement>(
       'g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]'
     )
   );
-  const roots: SVGGElement[] = pageGroups.length ? pageGroups : [svg as unknown as SVGGElement];
+  const roots: (SVGGElement | SVGSVGElement)[] = pageRoots.length ? pageRoots : [svg];
 
-  const boxes: Array<{ y: number; bottom: number; height: number; width: number }> = [];
+  const boxes: Box[] = [];
   for (const root of roots) {
     const groups = Array.from(root.querySelectorAll<SVGGElement>("g"));
     for (const g of groups) {
       try {
         const b = g.getBBox();
         if (!isFinite(b.y) || !isFinite(b.height) || !isFinite(b.width)) continue;
-        // ignore very small decorative fragments
-        if (b.height < 8 || b.width < 40) continue;
-        boxes.push({ y: b.y, bottom: b.y + b.height, height: b.height, width: b.width });
-      } catch {
-        /* ignore */
-      }
+        if (b.height < 8 || b.width < 40) continue; // ignore tiny fragments
+        boxes.push({ y: b.y, bottom: b.y + b.height, height: b.height, width: b.width, el: g });
+      } catch { /* ignore */ }
     }
   }
-  if (!boxes.length) return [];
+  if (!boxes.length) return { bands: [] as Band[], svgWidth: (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width) || svg.clientWidth || 0 };
 
   boxes.sort((a, b) => a.y - b.y);
 
   const GAP = 24; // px
-  const bands: Array<{ top: number; bottom: number; maxWidth: number }> = [];
+  const rawBands: { top: number; bottom: number; members: Box[] }[] = [];
   for (const b of boxes) {
-    const last = bands[bands.length - 1];
+    const last = rawBands[rawBands.length - 1];
     if (!last || b.y - last.bottom > GAP) {
-      bands.push({ top: b.y, bottom: b.bottom, maxWidth: b.width });
+      rawBands.push({ top: b.y, bottom: b.bottom, members: [b] });
     } else {
       if (b.y < last.top) last.top = b.y;
       if (b.bottom > last.bottom) last.bottom = b.bottom;
-      if (b.width > last.maxWidth) last.maxWidth = b.width;
+      last.members.push(b);
     }
   }
-  return bands.map(b => ({ top: b.top, bottom: b.bottom, height: b.bottom - b.top, maxWidth: b.maxWidth }));
+
+  // Feature: count tall vertical lines in each band (barlines/brackets are strong “system” signals)
+  function countVerticals(members: Box[]) {
+    let count = 0;
+    for (const m of members) {
+      const lines = Array.from(m.el.querySelectorAll<SVGLineElement>("line"));
+      for (const ln of lines) {
+        const x1 = Number(ln.getAttribute("x1") || "0");
+        const x2 = Number(ln.getAttribute("x2") || "0");
+        const y1 = Number(ln.getAttribute("y1") || "0");
+        const y2 = Number(ln.getAttribute("y2") || "0");
+        const dx = Math.abs(x1 - x2);
+        const dy = Math.abs(y1 - y2);
+        if (dx <= 1 && dy > 30) count++; // thin & tall
+      }
+      // Some editions draw barlines as skinny rects/paths; approximate via bbox ratio
+      const paths = Array.from(m.el.querySelectorAll<SVGGraphicsElement>("path,rect"));
+      for (const p of paths) {
+        try {
+          const bb = p.getBBox();
+          if (bb.width <= 2 && bb.height > 30) count++;
+        } catch { /* ignore */ }
+      }
+    }
+    return count;
+  }
+
+  const bands: Band[] = rawBands.map(b => {
+    const maxWidth = Math.max(...b.members.map(m => m.width));
+    return { top: b.top, bottom: b.bottom, height: b.bottom - b.top, maxWidth, verticalLines: countVerticals(b.members) };
+  });
+
+  const svgWidth = (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width) || svg.clientWidth || 0;
+  return { bands, svgWidth };
 }
 
-/** Heuristic: drop a top header/title band (common cause of +1 count). */
-function filterOutHeader(bands: Array<{ top: number; bottom: number; height: number; maxWidth: number }>) {
+/** Drop the top header/title band using stronger heuristics. */
+function dropHeaderIfPresent(bands: ReturnType<typeof analyzeBands>["bands"], svgWidth: number) {
   if (bands.length < 2) return bands;
   const [first, second] = bands;
-  const firstIsHeader =
-    first.top < 40 ||                 // very near top margin
-    first.height > second.height * 1.5; // much taller than a staff system
-  return firstIsHeader ? bands.slice(1) : bands;
+
+  // Median height among all bands (excluding the first for robustness)
+  const restHeights = bands.slice(1).map(b => b.height).sort((a, b) => a - b);
+  const median = restHeights.length
+    ? restHeights[Math.floor(restHeights.length / 2)]
+    : second.height;
+
+  const widthCov = svgWidth ? first.maxWidth / svgWidth : 1; // 0..1
+  const looksLikeHeader =
+    first.verticalLines <= 1 &&                              // little to no barlines
+    (first.height > median * 1.3 || first.height > 80) &&   // unusually tall
+    widthCov < 0.9;                                         // usually not full width
+
+  return looksLikeHeader ? bands.slice(1) : bands;
 }
 
 export default function ScoreOSMD({ src, height = 600, className = "", style }: Props) {
@@ -77,41 +120,43 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
   const osmdRef = useRef<OSMDInstance | null>(null);
 
   const lastWidthRef = useRef<number | null>(null);
-  const rafRef = useRef<number | null>(null);
+  const debounceTimer = useRef<number | null>(null);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
-  const lastSignatureRef = useRef<string>(""); // for dedupe
+  const lastSigRef = useRef<string>("");
 
-  const scheduleMeasure = () => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = requestAnimationFrame(() => {
-        if (!boxRef.current) return;
-        const raw = measureBands(boxRef.current);
-        const systems = filterOutHeader(raw);
+  const logOnce = () => {
+    if (!boxRef.current) return;
+    const { bands, svgWidth } = analyzeBands(boxRef.current);
+    const systems = dropHeaderIfPresent(bands, svgWidth);
 
-        // Build a signature to suppress duplicate logs from multi-trigger
-        const sig = `${lastWidthRef.current}|${systems.length}|${systems.map(s => s.height.toFixed(1)).join(",")}`;
-        if (sig === lastSignatureRef.current) return;
-        lastSignatureRef.current = sig;
+    const sig = `${lastWidthRef.current}|${systems.length}|${systems.map(s => s.height.toFixed(1)).join(",")}`;
+    if (sig === lastSigRef.current) return; // dedupe identical results
+    lastSigRef.current = sig;
 
-        if (!systems.length) {
-          console.warn("No systems detected during measurement.");
-          return;
-        }
-        console.table(
-          systems.map((s, i) => ({
-            line: i + 1,
-            top: s.top.toFixed(1),
-            bottom: s.bottom.toFixed(1),
-            height: s.height.toFixed(1),
-          }))
-        );
-        const tallest = systems.reduce((a, b) => (b.height > a.height ? b : a), systems[0]);
-        console.log(
-          `Tallest line → line ${systems.indexOf(tallest) + 1}, height ${tallest.height.toFixed(1)} px`
-        );
-      });
-    });
+    if (!systems.length) {
+      console.warn("No systems detected during measurement.");
+      return;
+    }
+    // Force a fresh array literal so DevTools renders a table reliably
+    console.table(
+      systems.map((s, i) => ({
+        line: i + 1,
+        top: s.top.toFixed(1),
+        bottom: s.bottom.toFixed(1),
+        height: s.height.toFixed(1),
+      }))
+    );
+    const tallest = systems.reduce((a, b) => (b.height > a.height ? b : a), systems[0]);
+    console.log(`Tallest line → line ${systems.indexOf(tallest) + 1}, height ${tallest.height.toFixed(1)} px`);
+  };
+
+  const scheduleLog = () => {
+    if (debounceTimer.current) {
+      window.clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+    // Debounce bursty resize/reflow events
+    debounceTimer.current = window.setTimeout(logOnce, 120);
   };
 
   useEffect(() => {
@@ -142,21 +187,18 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
 
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
-
       osmd.render();
 
-      // Initial measure
-      scheduleMeasure();
+      // Initial measure (debounced to allow any immediate auto-resize)
+      scheduleLog();
 
-      // Observe width changes; OSMD will auto-reflow, then we re-measure
+      // Observe width changes
       if (!resizeObsRef.current) {
         resizeObsRef.current = new ResizeObserver(entries => {
-          const cr = entries[0]?.contentRect;
-          if (!cr) return;
-          const w = Math.round(cr.width);
-          if (w !== lastWidthRef.current) {
+          const w = Math.round(entries[0]?.contentRect?.width ?? 0);
+          if (w && w !== lastWidthRef.current) {
             lastWidthRef.current = w;
-            scheduleMeasure();
+            scheduleLog();
           }
         });
         resizeObsRef.current.observe(boxRef.current);
@@ -166,8 +208,13 @@ export default function ScoreOSMD({ src, height = 600, className = "", style }: 
     });
 
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      if (resizeObsRef.current && boxRef.current) resizeObsRef.current.unobserve(boxRef.current);
+      if (debounceTimer.current) {
+        window.clearTimeout(debounceTimer.current);
+        debounceTimer.current = null;
+      }
+      if (resizeObsRef.current && boxRef.current) {
+        resizeObsRef.current.unobserve(boxRef.current);
+      }
       resizeObsRef.current = null;
       if (osmdRef.current) {
         osmdRef.current.clear?.();
