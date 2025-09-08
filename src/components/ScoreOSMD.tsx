@@ -6,11 +6,11 @@ import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
 /* ---- Props ---- */
 type Props = {
-  src: string;                 // e.g. "/scores/gymnopedie-no-1-satie.mxl"
-  fillParent?: boolean;        // height: 100% if true
-  height?: number;             // px when not filling parent
-  debug?: boolean;             // console tables
-  allowScroll?: boolean;       // true to temporarily allow vertical scroll
+  src: string;
+  fillParent?: boolean;
+  height?: number;
+  debug?: boolean;
+  allowScroll?: boolean;
   className?: string;
   style?: React.CSSProperties;
 };
@@ -23,8 +23,7 @@ function afterPaint(): Promise<void> {
   return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 }
 function purgeWebGL(node: HTMLElement): void {
-  const canvases = Array.from(node.querySelectorAll("canvas"));
-  for (const c of canvases) {
+  for (const c of Array.from(node.querySelectorAll("canvas"))) {
     try {
       const gl =
         (c.getContext("webgl") as WebGLRenderingContext | null) ||
@@ -33,9 +32,7 @@ function purgeWebGL(node: HTMLElement): void {
       const ext = gl?.getExtension("WEBGL_lose_context");
       (ext as { loseContext?: () => void } | null)?.loseContext?.();
       c.remove();
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }
 }
 
@@ -55,22 +52,18 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   const boxes: Box[] = [];
 
   for (const root of roots) {
-    const groups = Array.from(root.querySelectorAll<SVGGElement>("g"));
-    for (const g of groups) {
+    for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
       try {
         const r = g.getBoundingClientRect();
         if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-        if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
+        if (r.height < 8 || r.width < 40) continue;
         boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
-      } catch {
-        /* detached node during layout: ignore */
-      }
+      } catch {}
     }
   }
 
   boxes.sort((a, b) => a.top - b.top);
 
-  // Cluster into systems with a reasonable vertical gap
   const GAP = 18; // px
   const bands: Band[] = [];
   for (const b of boxes) {
@@ -96,11 +89,10 @@ function linesThatFit(bands: Band[], containerH: number, padPx: number): number 
   return Math.max(1, n);
 }
 
-/* ---- SVG helpers (clear transform while measuring) ---- */
+/* ---- SVG helpers ---- */
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg") as SVGSVGElement | null;
 }
-
 function withUntransformedSvg<T>(
   outer: HTMLDivElement,
   fn: (svg: SVGSVGElement) => T
@@ -108,7 +100,7 @@ function withUntransformedSvg<T>(
   const svg = getSvg(outer);
   if (!svg) return null;
   const prev = svg.style.transform;
-  svg.style.transform = "none"; // remove translation for true CSS-px measurements
+  svg.style.transform = "none";
   try {
     return fn(svg);
   } finally {
@@ -116,7 +108,7 @@ function withUntransformedSvg<T>(
   }
 }
 
-/* ---- OSMD instance type with optional lifecycle ---- */
+/* ---- OSMD instance type ---- */
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
 /* ============================== Component =============================== */
@@ -129,25 +121,26 @@ export default function ScoreOSMD({
   className = "",
   style,
 }: Props) {
-  // OUTER wrapper (relative; overlays live here)
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  // INNER host (OSMD renders here and may clear it)
   const osmdHostRef = useRef<HTMLDivElement | null>(null);
-
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
-  // DOM-based paging model
+  // DOM-based model
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
-  const pageRef = useRef<number>(0); // 0-based
+  const pageRef = useRef<number>(0);
   const readyRef = useRef<boolean>(false);
+
+  // Bottom mask overlay (hides any partial next system)
+  const maskRef = useRef<HTMLDivElement | null>(null);
 
   // HUD
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // constants
-  const FIT_PAD = 22; // px at bottom so next system never peeks (tuned)
+  const TOP_PAD = 6;   // px: a little headroom so slurs don’t kiss the top
+  const FIT_PAD = 22;  // px: bottom safety
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -159,6 +152,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
+  // Apply translation AND update the bottom mask to hide partials
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -172,22 +166,31 @@ export default function ScoreOSMD({
     const pageIdx = Math.min(Math.max(0, p), maxPageIdx);
     pageRef.current = pageIdx;
 
-    const startBandIdx = pageIdx * perPage;
-    const y = bands[startBandIdx]?.top ?? 0;
+    const startIdx = pageIdx * perPage;
+    const startTop = bands[startIdx]?.top ?? 0;
+    const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
+    const lastBottom = bands[lastIdx]?.bottom ?? startTop;
 
-    // Snap upward using ceil so the previous system never peeks by a subpixel
-    const ySnap = Math.ceil(y);
+    const ySnap = Math.ceil(startTop - TOP_PAD); // small cushion at the top
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
+    // Where to place the bottom mask (relative to container)
+    const visibleBottom = (lastBottom - startTop) + TOP_PAD; // last fully visible line bottom relative to top
+    const maskTop = Math.max(0, Math.ceil(visibleBottom));
+    // position the mask
+    if (maskRef.current && wrapRef.current) {
+      maskRef.current.style.top = `${maskTop}px`;
+      maskRef.current.style.display = "block";
+    }
+
     updateHUD();
-  }, [updateHUD]);
+  }, [TOP_PAD, updateHUD]);
 
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
 
-    // Measure with transform cleared so rects are true CSS pixels
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
@@ -233,7 +236,7 @@ export default function ScoreOSMD({
     [applyTranslateForPage]
   );
 
-  // Wheel + Keys on window
+  // Wheel + Keys
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -246,16 +249,10 @@ export default function ScoreOSMD({
     };
     const onKey = (e: KeyboardEvent) => {
       if (!readyRef.current) return;
-      if (["PageDown", "ArrowDown", " "].includes(e.key)) {
-        e.preventDefault();
-        nextPage(1);
-      } else if (["PageUp", "ArrowUp"].includes(e.key)) {
-        e.preventDefault();
-        nextPage(-1);
-      } else if (e.key === "Home") {
-        e.preventDefault();
-        applyTranslateForPage(0);
-      } else if (e.key === "End") {
+      if (["PageDown", "ArrowDown", " "].includes(e.key)) { e.preventDefault(); nextPage(1); }
+      else if (["PageUp", "ArrowUp"].includes(e.key)) { e.preventDefault(); nextPage(-1); }
+      else if (e.key === "Home") { e.preventDefault(); applyTranslateForPage(0); }
+      else if (e.key === "End") {
         e.preventDefault();
         const perPage = Math.max(1, perPageRef.current);
         const total = bandsRef.current.length;
@@ -263,7 +260,6 @@ export default function ScoreOSMD({
         applyTranslateForPage(last);
       }
     };
-
     window.addEventListener("wheel", onWheel, { passive: allowScroll });
     window.addEventListener("keydown", onKey);
     return () => {
@@ -284,7 +280,6 @@ export default function ScoreOSMD({
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // Clean previous instance
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -292,7 +287,7 @@ export default function ScoreOSMD({
       }
 
       const osmd = new OpenSheetMusicDisplay(host, {
-        backend: "svg" as const, // ensure SVG
+        backend: "svg" as const,
         autoResize: true,
         drawTitle: true,
         drawSubtitle: true,
@@ -313,7 +308,7 @@ export default function ScoreOSMD({
       recomputeLayoutAndPage();
       readyRef.current = true;
 
-      // Observe wrapper size (both width & height)
+      // Observe wrapper size
       localResizeObs = new ResizeObserver(() => {
         recomputeLayoutAndPage();
       });
@@ -359,17 +354,30 @@ export default function ScoreOSMD({
 
   return (
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
-      {/* OSMD renders into this element */}
+      {/* OSMD renders here */}
       <div ref={osmdHostRef} style={osmdHostStyle} />
+
+      {/* Bottom mask to hide any partial next system */}
+      <div
+        ref={maskRef}
+        aria-hidden
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          top: 0,        // updated dynamically
+          bottom: 0,
+          background: "#fff",
+          pointerEvents: "none",
+          zIndex: 5,
+          display: "none",
+        }}
+      />
 
       {/* Overlay controls */}
       <div style={{ position: "absolute", right: 10, top: 10, display: "flex", gap: 8, zIndex: 10 }}>
-        <button type="button" style={btn} onClick={() => nextPage(-1)}>
-          Prev
-        </button>
-        <button type="button" style={btn} onClick={() => nextPage(1)}>
-          Next
-        </button>
+        <button type="button" style={btn} onClick={() => nextPage(-1)}>Prev</button>
+        <button type="button" style={btn} onClick={() => nextPage(1)}>Next</button>
       </div>
 
       <div
