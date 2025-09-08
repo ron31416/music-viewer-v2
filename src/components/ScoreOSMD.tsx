@@ -4,105 +4,98 @@ import { useEffect, useRef, useState } from "react";
 import { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
 type ScoreOSMDProps = {
+  /** Absolute or root-relative path to a MusicXML/MXL file (e.g., "/scores/example.mxl"). */
   src: string;
+  /** Initial zoom (1 = 100%). */
   zoom?: number;
-  showControls?: boolean;
+  /** Show minimal zoom controls + status. */
+  showUI?: boolean;
+  /** Optional class + inline style passthroughs for the outer wrapper. */
   className?: string;
   style?: React.CSSProperties;
+  /** Draw the title from score metadata (OSMD option). */
+  drawTitle?: boolean;
 };
 
-type OSMDCompat = OpenSheetMusicDisplay & {
-  /** Older OSMD runtime uses capitalized Zoom */
-  Zoom?: number;
-  /** Future/variant runtime might expose lowercase zoom */
-  zoom?: number;
-};
-
+/** Support both OSMD.Zoom and OSMD.zoom without using 'any'. */
+type OSMDCompat = OpenSheetMusicDisplay & { Zoom?: number; zoom?: number };
 function setOsmdZoom(osmd: OpenSheetMusicDisplay, z: number) {
   const o = osmd as OSMDCompat;
   if (typeof o.Zoom === "number") o.Zoom = z;
   else if (typeof o.zoom === "number") o.zoom = z;
 }
 
+/** Wait until an element has non-zero width & height (dialogs/tabs can start at 0). */
+async function waitForNonZeroSize(el: HTMLElement, maxFrames = 30): Promise<boolean> {
+  let frames = 0;
+  if (el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+  return new Promise<boolean>((resolve) => {
+    const step = () => {
+      if (el.offsetWidth > 0 && el.offsetHeight > 0) return resolve(true);
+      if (frames++ >= maxFrames) return resolve(false);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+}
+
 export default function ScoreOSMD({
   src,
   zoom = 1,
-  showControls = true,
+  showUI = true,
   className = "",
   style,
+  drawTitle = false,
 }: ScoreOSMDProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
   const [localZoom, setLocalZoom] = useState(zoom);
-  const [status, setStatus] = useState<string>("idle");
+  const [status, setStatus] = useState<"idle" | "waiting" | "loading" | "rendering" | "rendered" | "error" | "file-error" | "no-size">("idle");
   const [box, setBox] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
+  // Keep internal zoom synchronized with prop.
   useEffect(() => setLocalZoom(zoom), [zoom]);
 
-  // Wait until the container has non-zero size (dialogs/tabs can start at 0)
-  const waitForBox = async (): Promise<boolean> => {
-    const el = containerRef.current;
-    if (!el) return false;
-    let tries = 0;
-    while (tries < 12) {
-      const w = el.offsetWidth;
-      const h = el.offsetHeight;
-      setBox({ w, h });
-      if (w > 0 && h > 0) return true;
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      tries++;
-    }
-    return el.offsetWidth > 0 && el.offsetHeight > 0;
-  };
-
+  // Initialize / load / render when src changes (or on first mount).
   useEffect(() => {
     let cancelled = false;
 
     const run = async () => {
-      if (!containerRef.current) return;
+      const el = containerRef.current;
+      if (!el) return;
 
-      setStatus("checking src…");
-      try {
-        const resp = await fetch(src, { method: "GET" });
-        if (!resp.ok) {
-          setStatus(`file error ${resp.status} (${resp.statusText})`);
-          return;
-        }
-      } catch {
-        setStatus("network error");
-        return;
-      }
-
-      setStatus("waiting for layout…");
-      const sized = await waitForBox();
-      if (!sized || cancelled) {
-        if (!sized) setStatus("container is size 0 — check parent sizing");
+      setStatus("waiting");
+      const okSize = await waitForNonZeroSize(el);
+      if (cancelled) return;
+      if (!okSize) {
+        setStatus("no-size");
         return;
       }
 
       try {
+        // (Re)create OSMD once per container lifecycle.
         if (!osmdRef.current) {
-          osmdRef.current = new OpenSheetMusicDisplay(containerRef.current, {
-            autoResize: false,
+          osmdRef.current = new OpenSheetMusicDisplay(el, {
+            autoResize: false,   // we manage resizing below with ResizeObserver
             backend: "svg",
-            drawTitle: false,
+            drawTitle,
           });
         }
-        const osmd = osmdRef.current;
 
-        setStatus("loading…");
+        const osmd = osmdRef.current;
+        setStatus("loading");
+        // If src 404s, OSMD throws; we surface that cleanly.
         await osmd.load(src);
         if (cancelled) return;
 
         setOsmdZoom(osmd, localZoom);
-        await new Promise<void>((r) => requestAnimationFrame(() => r()));
-
-        setStatus("rendering…");
+        setStatus("rendering");
         await osmd.render();
         setStatus("rendered");
-      } catch (err: unknown) {
+      } catch (err) {
         console.error("[ScoreOSMD] load/render failed:", err);
-        setStatus("error (see console)");
+        // Distinguish file path problems a bit for quicker diagnosis.
+        setStatus(String(err).toLowerCase().includes("404") ? "file-error" : "error");
       }
     };
 
@@ -110,12 +103,13 @@ export default function ScoreOSMD({
     return () => {
       cancelled = true;
     };
-  }, [src, localZoom]);
+  }, [src, localZoom, drawTitle]);
 
-  // Re-render when the box size changes (dialog opens, window resizes, etc.)
+  // Re-render when the container size changes (dialog opens, window resizes, etc.)
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+
     const ro = new ResizeObserver(() => {
       setBox({ w: el.offsetWidth, h: el.offsetHeight });
       const osmd = osmdRef.current;
@@ -123,14 +117,17 @@ export default function ScoreOSMD({
       try {
         osmd.render();
       } catch {
-        /* noop */
+        /* ignore transient render issues during layout */
       }
     });
+
     ro.observe(el);
+    setBox({ w: el.offsetWidth, h: el.offsetHeight });
+
     return () => ro.disconnect();
   }, []);
 
-  // Cleanup
+  // Cleanup on unmount (remove SVG, drop instance).
   useEffect(() => {
     return () => {
       try {
@@ -144,20 +141,16 @@ export default function ScoreOSMD({
 
   return (
     <div className={className} style={style}>
-      {showControls && (
-        <div className="flex items-center gap-2 mb-2" aria-label="score zoom controls">
+      {showUI && (
+        <div className="flex items-center gap-2 mb-2" aria-label="score controls">
           <button
             type="button"
             className="px-2 py-1 rounded border"
-            onClick={() =>
-              setLocalZoom((z) => Number(Math.max(0.1, z - 0.1).toFixed(2)))
-            }
+            onClick={() => setLocalZoom((z) => Number(Math.max(0.1, z - 0.1).toFixed(2)))}
           >
             −
           </button>
-          <span className="tabular-nums w-[5ch] text-center">
-            {(localZoom * 100).toFixed(0)}%
-          </span>
+          <span className="tabular-nums w-[5ch] text-center">{(localZoom * 100).toFixed(0)}%</span>
           <button
             type="button"
             className="px-2 py-1 rounded border"
@@ -165,15 +158,27 @@ export default function ScoreOSMD({
           >
             +
           </button>
-          <button
-            type="button"
-            className="px-2 py-1 rounded border"
-            onClick={() => setLocalZoom(1)}
-          >
+          <button type="button" className="px-2 py-1 rounded border" onClick={() => setLocalZoom(1)}>
             Reset
           </button>
           <span className="ml-3 text-sm opacity-70">
-            Status: {status} {box.w > 0 && `• ${box.w}×${box.h}`} • {src}
+            {status === "rendered"
+              ? `Rendered • ${box.w}×${box.h}`
+              : status === "waiting"
+              ? `Waiting for layout…`
+              : status === "loading"
+              ? `Loading…`
+              : status === "rendering"
+              ? `Rendering…`
+              : status === "no-size"
+              ? `Container size is 0 (give the wrapper width/height)`
+              : status === "file-error"
+              ? `File error (check src path or 404)`
+              : status === "error"
+              ? `Error (see console)`
+              : `Idle`}
+            {" • "}
+            {src}
           </span>
         </div>
       )}
