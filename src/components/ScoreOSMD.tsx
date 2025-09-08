@@ -18,7 +18,9 @@ function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as { then?: unknown });
 }
 function afterPaint(): Promise<void> {
-  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+  return new Promise((r) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => r()))
+  );
 }
 function purgeWebGL(node: HTMLElement): void {
   for (const c of Array.from(node.querySelectorAll("canvas"))) {
@@ -119,9 +121,22 @@ export default function ScoreOSMD({
   const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // Tunables
-  const FIT_PAD = 22;            // bottom safety (px)
-  const WHEEL_THROTTLE_MS = 140; // wheel rate limit
+  const FIT_PAD = 22;               // bottom safety (px)
+  const WHEEL_THROTTLE_MS = 140;    // wheel rate limit
   const wheelLockRef = useRef<number>(0);
+
+  // --- RAF debounce for resize measurements ---
+  const rafTicket1 = useRef<number | null>(null);
+  const rafTicket2 = useRef<number | null>(null);
+  const scheduleRecompute = useCallback(() => {
+    if (rafTicket1.current != null) cancelAnimationFrame(rafTicket1.current);
+    if (rafTicket2.current != null) cancelAnimationFrame(rafTicket2.current);
+    rafTicket1.current = requestAnimationFrame(() => {
+      rafTicket2.current = requestAnimationFrame(() => {
+        recomputeLayoutAndPage(); // after two RAFs → OSMD auto layout has settled
+      });
+    });
+  }, []);
 
   const updateHUD = useCallback(() => {
     const total = bandsRef.current.length;
@@ -131,7 +146,7 @@ export default function ScoreOSMD({
     setHud({ page, maxPage, perPage, total });
   }, []);
 
-  // Translate + mask (no top padding; mask starts at NEXT system's top)
+  // Translate + mask (no top padding). Mask starts at NEXT system's top.
   const applyTranslateForPage = useCallback((p: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -150,13 +165,13 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    // align exactly to the top of the first visible system
-    const ySnap = Math.round(startTop);
+    // Ceil so we never leave a top gap due to fractional px
+    const ySnap = Math.ceil(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // bottom mask begins at NEXT system's top (so we never clip the current last full line)
-    let maskTop = outer.clientHeight; // default: hide nothing extra
+    // Bottom mask begins at NEXT system's top (relative to aligned top)
+    let maskTop = outer.clientHeight; // default (no mask)
     if (nextIdx < bands.length) {
       const nextTopRel = bands[nextIdx].top - startTop;
       maskTop = Math.min(outer.clientHeight - 1, Math.max(0, Math.ceil(nextTopRel)));
@@ -174,7 +189,7 @@ export default function ScoreOSMD({
     updateHUD();
   }, [updateHUD, debug]);
 
-  // Recompute bands and per-page count (no top pad involved)
+  // Recompute bands and per-page count
   const recomputeLayoutAndPage = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -304,8 +319,9 @@ export default function ScoreOSMD({
       recomputeLayoutAndPage();
       readyRef.current = true;
 
+      // Debounced resize observer (wait 2 RAFs)
       localResizeObs = new ResizeObserver(() => {
-        recomputeLayoutAndPage();
+        scheduleRecompute();
       });
       localResizeObs.observe(wrapper);
       resizeObsRef.current = localResizeObs;
@@ -322,8 +338,10 @@ export default function ScoreOSMD({
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
+      if (rafTicket1.current != null) cancelAnimationFrame(rafTicket1.current);
+      if (rafTicket2.current != null) cancelAnimationFrame(rafTicket2.current);
     };
-  }, [src, recomputeLayoutAndPage]);
+  }, [src, recomputeLayoutAndPage, scheduleRecompute]);
 
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden", background: "#fff" }
