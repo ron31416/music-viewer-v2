@@ -1,10 +1,9 @@
-// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* ---------- minimal structural types ---------- */
+/* Minimal structural types */
 interface SourceMeasure { MeasureNumber?: number }
 interface GraphicalMeasure {
   SourceMeasure?: SourceMeasure;
@@ -24,16 +23,15 @@ type OSMDInstance = OpenSheetMusicDisplay & {
 };
 
 type Props = {
-  src: string;                 // e.g. "/scores/gymnopedie-no-1-satie.mxl"
-  fillParent?: boolean;        // height: 100% if true
-  height?: number;             // px when not filling parent
-  debug?: boolean;             // console tables
-  allowScroll?: boolean;       // set true if you want a test scrollbar
+  src: string;
+  fillParent?: boolean;
+  height?: number;
+  debug?: boolean;
+  allowScroll?: boolean; // set true if you want to temporarily test a scrollbar
   className?: string;
   style?: React.CSSProperties;
 };
 
-/* ---------- small helpers ---------- */
 function isPromise<T=unknown>(x:unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as Record<string, unknown>);
 }
@@ -52,43 +50,33 @@ function purgeWebGL(node: HTMLElement) {
   }
 }
 
-/* ---------- DOM measurement (CSS pixels, not SVG units) ---------- */
-type Band = { top: number; bottom: number; height: number };
-function analyzeBandsPx(container: HTMLDivElement): Band[] {
-  const svg = container.querySelector("svg");
+/* --- CSS-pixel system measurement --- */
+type Band = { top:number; bottom:number; height:number };
+function analyzeBandsPx(host: HTMLDivElement, osmdRoot: HTMLElement): Band[] {
+  const svg = osmdRoot.querySelector("svg");
   if (!svg) return [];
+  const pages = Array.from(svg.querySelectorAll<SVGGElement>(
+    'g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]'
+  ));
+  const roots: Array<SVGGElement|SVGSVGElement> = pages.length ? pages : [svg];
 
-  // Prefer page groups if present
-  const pageRoots = Array.from(
-    svg.querySelectorAll<SVGGElement>(
-      'g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]'
-    )
-  );
-  const roots: Array<SVGGElement | SVGSVGElement> = pageRoots.length ? pageRoots : [svg];
+  const hostTop = host.getBoundingClientRect().top;
 
-  const containerTop = container.getBoundingClientRect().top;
-
-  type BoxPx = { top:number; bottom:number; height:number; width:number };
-  const boxes: BoxPx[] = [];
-
+  type Box = { top:number; bottom:number; height:number; width:number };
+  const boxes: Box[] = [];
   for (const root of roots) {
-    const groups = Array.from(root.querySelectorAll<SVGGElement>("g"));
-    for (const g of groups) {
+    for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
       try {
-        const r = g.getBoundingClientRect(); // ← CSS pixels
-        const height = r.height;
-        const width = r.width;
-        if (!Number.isFinite(r.top) || !Number.isFinite(height) || !Number.isFinite(width)) continue;
-        if (height < 8 || width < 40) continue; // ignore tiny fragments
-        boxes.push({ top: r.top - containerTop, bottom: r.bottom - containerTop, height, width });
+        const r = g.getBoundingClientRect();
+        if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
+        if (r.height < 8 || r.width < 40) continue;
+        boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
       } catch {}
     }
   }
+  boxes.sort((a,b)=>a.top-b.top);
 
-  boxes.sort((a, b) => a.top - b.top);
-
-  // Cluster into systems using a pixel gap
-  const GAP = 18; // px – slightly tighter since rects include real spacing
+  const GAP = 18; // px
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -103,19 +91,19 @@ function analyzeBandsPx(container: HTMLDivElement): Band[] {
   return bands;
 }
 
-function linesThatFit(bands: Band[], container: HTMLDivElement, padPx: number) {
-  const limit = container.clientHeight - padPx;
-  let count = 0;
+function linesThatFit(bands: Band[], containerH: number, pad:number) {
+  const limit = containerH - pad;
+  let n = 0;
   for (const b of bands) {
-    if (b.bottom <= limit) count++;
+    if (b.bottom <= limit) n++;
     else break;
   }
-  return Math.max(1, count);
+  return Math.max(1, n);
 }
 
-/* Build a stable system→lastMeasure map from the full layout (all pages) */
+/* Build stable system→lastMeasure from full layout */
 function buildSystemEnds(osmd: OSMDInstance): number[] {
-  const ends: number[] = [];
+  const ends:number[] = [];
   const pages = osmd.GraphicalMusicSheet?.MusicPages ?? [];
   for (const p of pages) {
     for (const sys of (p.MusicSystems ?? [])) {
@@ -140,7 +128,6 @@ function setMeasureOptions(osmd: OSMDInstance, o: MeasureSliceOptions) {
   (osmd as unknown as { setOptions:(o:MeasureSliceOptions)=>void }).setOptions(o);
 }
 
-/* ============================== Component =============================== */
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -150,23 +137,25 @@ export default function ScoreOSMD({
   className = "",
   style
 }: Props) {
-  const boxRef = useRef<HTMLDivElement|null>(null);
+  // OUTER wrapper: relative, overlays live here
+  const wrapRef = useRef<HTMLDivElement|null>(null);
+  // INNER container: OSMD renders here (and may clear it)
+  const osmdRefDiv = useRef<HTMLDivElement|null>(null);
+
   const osmdRef = useRef<OSMDInstance|null>(null);
   const resizeObsRef = useRef<ResizeObserver|null>(null);
   const debounceRef = useRef<number|null>(null);
 
-  // Stable paging model
   const systemEndsRef = useRef<number[]>([]);
   const startSystemRef = useRef(0);
   const nLinesRef = useRef(1);
   const currentRangeRef = useRef<{from:number; upTo:number}>({from:0, upTo:0});
   const readyRef = useRef(false);
 
-  // UI state for HUD
-  const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
+  const [hud, setHud] = useState({ page:1, maxPage:1, perPage:1, total:0 });
 
-  const FIT_PAD = 20;     // safety margin at bottom
-  const VALIDATE_MAX = 5; // shrink attempts if last line still peeks
+  const FIT_PAD = 20;
+  const VALIDATE_MAX = 6;
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef(0);
 
@@ -179,7 +168,8 @@ export default function ScoreOSMD({
   }
 
   async function renderPage(start:number, n:number) {
-    const container = boxRef.current!;
+    const host = wrapRef.current!;
+    const inner = osmdRefDiv.current!;
     const osmd = osmdRef.current!;
     const ends = systemEndsRef.current;
     if (!ends.length) return;
@@ -192,21 +182,19 @@ export default function ScoreOSMD({
     const upTo = ends[endIdx];
     const from = s === 0 ? 1 : ends[s - 1] + 1;
 
-    // Always apply the range (some builds ignore no-op)
     setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
     osmd.render();
     currentRangeRef.current = { from, upTo };
     await afterPaint();
 
-    // Validate after slice using CSS-pixel bands
+    // Validate after slice using CSS px bands
     let tries = 0;
     while (tries < VALIDATE_MAX) {
-      const bands = analyzeBandsPx(container);
-      const limit = container.clientHeight - FIT_PAD;
+      const bands = analyzeBandsPx(host, inner);
+      const limit = host.clientHeight - FIT_PAD;
       const lastBand = bands[bands.length - 1];
       if (!lastBand || lastBand.bottom <= limit) break;
-
-      if (n <= 1) break; // can’t shrink further
+      if (n <= 1) break; // can't shrink further
       n -= 1;
       const newEndIdx = Math.min(total - 1, s + n - 1);
       const newUpTo = ends[newEndIdx];
@@ -230,23 +218,22 @@ export default function ScoreOSMD({
       debounceRef.current = null;
     }
     const run = async () => {
-      const container = boxRef.current;
+      const host = wrapRef.current;
+      const inner = osmdRefDiv.current;
       const osmd = osmdRef.current;
-      if (!container || !osmd) return;
+      if (!host || !inner || !osmd) return;
 
-      purgeWebGL(container);
+      purgeWebGL(host);
 
-      // Full render
+      // Full render (clear slice)
       setMeasureOptions(osmd, { drawFromMeasureNumber: 1, drawUpToMeasureNumber: Number.MAX_SAFE_INTEGER });
       osmd.render();
       await afterPaint();
 
-      // Build stable system→measure map
+      // Stable map + lines per page in CSS px
       systemEndsRef.current = buildSystemEnds(osmd);
-
-      // Decide lines/page using **CSS pixel** bands
-      const bands = analyzeBandsPx(container);
-      const n = linesThatFit(bands, container, FIT_PAD);
+      const bands = analyzeBandsPx(host, inner);
+      const n = linesThatFit(bands, host.clientHeight, FIT_PAD);
       nLinesRef.current = n;
 
       if (debug) {
@@ -262,9 +249,8 @@ export default function ScoreOSMD({
 
       await renderPage(startSystemRef.current, n);
       readyRef.current = true;
-      purgeWebGL(container);
+      purgeWebGL(host);
     };
-
     if (immediate) void run();
     else debounceRef.current = window.setTimeout(() => { void run(); }, 60);
   }
@@ -285,7 +271,7 @@ export default function ScoreOSMD({
     }
   }
 
-  // Wheel + Keys on WINDOW (more reliable than container focus)
+  // Wheel + Keys on window (works regardless of scrollbars)
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -316,19 +302,18 @@ export default function ScoreOSMD({
     };
   }, [allowScroll]);
 
-  // Mount / load OSMD
+  // Mount / load
   useEffect(() => {
     (async () => {
-      if (!boxRef.current) return;
+      if (!osmdRefDiv.current) return;
       await afterPaint();
 
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // Cleanup any prior instance
       if (osmdRef.current) { osmdRef.current.clear?.(); osmdRef.current.dispose?.(); osmdRef.current = null; }
 
-      const osmd = new OpenSheetMusicDisplay(boxRef.current, {
+      const osmd = new OpenSheetMusicDisplay(osmdRefDiv.current, {
         backend: "svg" as const,
         autoResize: true,
         drawTitle: true,
@@ -342,59 +327,58 @@ export default function ScoreOSMD({
       if (isPromise(maybe)) await maybe;
       osmd.render();
 
-      // First compute/page immediately
+      // initial compute/page
       startSystemRef.current = 0;
       currentRangeRef.current = { from:0, upTo:0 };
       readyRef.current = false;
       scheduleRecompute(true);
 
-      // React to container size changes
-      if (!resizeObsRef.current) {
+      if (!resizeObsRef.current && wrapRef.current) {
         resizeObsRef.current = new ResizeObserver(() => scheduleRecompute());
-        resizeObsRef.current.observe(boxRef.current);
+        resizeObsRef.current.observe(wrapRef.current);
       }
     })().catch(err => { console.error("OSMD init error:", err); });
 
     return () => {
       if (debounceRef.current) { window.clearTimeout(debounceRef.current); debounceRef.current = null; }
-      if (resizeObsRef.current && boxRef.current) resizeObsRef.current.unobserve(boxRef.current);
+      if (resizeObsRef.current && wrapRef.current) resizeObsRef.current.unobserve(wrapRef.current);
       resizeObsRef.current = null;
       if (osmdRef.current) { osmdRef.current.clear?.(); osmdRef.current.dispose?.(); osmdRef.current = null; }
     };
   }, [src]);
 
-  /* --------------------- UI ---------------------- */
-  const containerStyle: React.CSSProperties = fillParent
-    ? { width:"100%", height:"100%", minHeight:0, overflowY: allowScroll ? "auto" : "hidden", overflowX:"hidden", position:"relative", background:"#fff" }
-    : { width:"100%", height: height ?? 600, minHeight: height ?? 600, overflowY: allowScroll ? "auto" : "hidden", overflowX:"hidden", position:"relative", background:"#fff" };
+  /* UI */
+  const outerStyle: React.CSSProperties = fillParent
+    ? { width:"100%", height:"100%", minHeight:0, position:"relative", overflow:"hidden" }
+    : { width:"100%", height: height ?? 600, minHeight: height ?? 600, position:"relative", overflow:"hidden" };
+
+  const osmdHostStyle: React.CSSProperties = {
+    position:"absolute", inset:0,
+    overflowY: allowScroll ? "auto" : "hidden",
+    overflowX: "hidden",
+    background:"#fff"
+  };
+
+  const btnStyle: React.CSSProperties = {
+    padding:"6px 10px", borderRadius:8, border:"1px solid #ccc", background:"#fff", cursor:"pointer"
+  };
 
   return (
-    <div ref={boxRef} className={`osmd-container ${className || ""}`} style={{ ...containerStyle, ...style }}>
-      {/* Overlay controls (rendered in React so they always appear) */}
+    <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
+      {/* OSMD renders here (it may clear/replace this element’s content) */}
+      <div ref={osmdRefDiv} style={osmdHostStyle} />
+
+      {/* Overlay controls (sibling -> OSMD can't erase them) */}
       <div style={{ position:"absolute", right:10, top:10, display:"flex", gap:8, zIndex:10 }}>
-        <button
-          type="button"
-          onClick={() => void changePage(-1)}
-          style={{ padding:"6px 10px", borderRadius:8, border:"1px solid #ccc", background:"#fff", cursor:"pointer" }}
-          aria-label="Previous page"
-        >
-          Prev
-        </button>
-        <button
-          type="button"
-          onClick={() => void changePage(1)}
-          style={{ padding:"6px 10px", borderRadius:8, border:"1px solid #ccc", background:"#fff", cursor:"pointer" }}
-          aria-label="Next page"
-        >
-          Next
-        </button>
+        <button type="button" style={btnStyle} onClick={() => void changePage(-1)}>Prev</button>
+        <button type="button" style={btnStyle} onClick={() => void changePage(1)}>Next</button>
       </div>
 
       <div
         style={{
           position:"absolute", right:10, bottom:10, padding:"6px 10px",
-          background:"rgba(0,0,0,0.55)", color:"#fff",
-          borderRadius:8, font:"12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial",
+          background:"rgba(0,0,0,0.55)", color:"#fff", borderRadius:8,
+          font:"12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial",
           zIndex:10, pointerEvents:"none"
         }}
       >
