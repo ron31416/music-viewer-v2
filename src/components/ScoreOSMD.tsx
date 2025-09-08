@@ -39,7 +39,7 @@ function afterPaint() {
   return new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 }
 
-/* belt & suspenders: kill any WebGL canvases */
+/* nuke any WebGL canvases that might appear */
 function purgeWebGL(node: HTMLElement) {
   for (const c of Array.from(node.querySelectorAll("canvas"))) {
     try {
@@ -52,7 +52,7 @@ function purgeWebGL(node: HTMLElement) {
   }
 }
 
-/* DOM measurement of systems */
+/* Measure systems from DOM */
 type Band = { top:number; bottom:number; height:number };
 function analyzeBands(container: HTMLDivElement): Band[] {
   const svg = container.querySelector("svg");
@@ -101,7 +101,7 @@ function linesPerPage(bands: Band[], container: HTMLDivElement, padPx:number) {
   return Math.max(1, count);
 }
 
-/* full-layout stable mapping: system index -> last measure number */
+/* system index → last measure number for entire score */
 function buildSystemEnds(osmd: OSMDInstance): number[] {
   const ends:number[] = [];
   const pages = osmd.GraphicalMusicSheet?.MusicPages ?? [];
@@ -147,12 +147,25 @@ export default function ScoreOSMD({
   const nLinesRef = useRef(1);
   const currentRangeRef = useRef<{from:number; upTo:number}>({from:0, upTo:0});
   const recomputingRef = useRef(false);
-  const readyRef = useRef(false);               // <- new: block paging until model built
+  const readyRef = useRef(false);
 
-  const FIT_PAD = 24;
-  const VALIDATE_MAX = 5;
-  const WHEEL_THROTTLE_MS = 160;
+  // simple HUD refs
+  const hudRef = useRef<HTMLDivElement|null>(null);
+
+  const FIT_PAD = 28;          // bigger pad for narrow layouts
+  const VALIDATE_MAX = 6;      // more retries
+  const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef(0);
+
+  function updateHUD() {
+    const hud = hudRef.current;
+    if (!hud) return;
+    const total = systemEndsRef.current.length;
+    const n = nLinesRef.current;
+    const page = Math.floor(startSystemRef.current / n) + 1;
+    const maxPage = Math.max(1, Math.ceil(total / n));
+    hud.textContent = `Page ${page}/${maxPage} • ${n} lines/page • ${total} systems`;
+  }
 
   async function renderPage(start:number, n:number) {
     const container = boxRef.current!;
@@ -168,12 +181,11 @@ export default function ScoreOSMD({
     const upTo = ends[endIdx];
     const from = s === 0 ? 1 : ends[s - 1] + 1;
 
-    if (currentRangeRef.current.from !== from || currentRangeRef.current.upTo !== upTo) {
-      setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
-      osmd.render();
-      currentRangeRef.current = { from, upTo };
-      await afterPaint();
-    }
+    // Always apply range (some OSMD builds coalesce no-op renders)
+    setMeasureOptions(osmd, { drawFromMeasureNumber: from, drawUpToMeasureNumber: upTo });
+    osmd.render();
+    currentRangeRef.current = { from, upTo };
+    await afterPaint();
 
     // validate (drop one line if still peeking)
     let tries = 0;
@@ -189,16 +201,16 @@ export default function ScoreOSMD({
       const newUpTo = ends[newEndIdx];
       const newFrom = s === 0 ? 1 : ends[s - 1] + 1;
 
-      if (currentRangeRef.current.from === newFrom && currentRangeRef.current.upTo === newUpTo) break;
-
       setMeasureOptions(osmd, { drawFromMeasureNumber: newFrom, drawUpToMeasureNumber: newUpTo });
       osmd.render();
       currentRangeRef.current = { from: newFrom, upTo: newUpTo };
       await afterPaint();
+
       tries++;
     }
 
     startSystemRef.current = s;
+    updateHUD();
   }
 
   function scheduleRecompute(immediate = false) {
@@ -241,7 +253,7 @@ export default function ScoreOSMD({
         if (startSystemRef.current > lastStart) startSystemRef.current = lastStart;
 
         await renderPage(startSystemRef.current, n);
-        readyRef.current = true;            // <- model ready; enable paging
+        readyRef.current = true;
         purgeWebGL(container);
       } finally {
         recomputingRef.current = false;
@@ -249,11 +261,11 @@ export default function ScoreOSMD({
     };
 
     if (immediate) void run();
-    else debounceRef.current = window.setTimeout(() => { void run(); }, 80);
+    else debounceRef.current = window.setTimeout(() => { void run(); }, 60);
   }
 
   async function changePage(deltaPages:number) {
-    if (!readyRef.current) return;           // <- ignore until model built
+    if (!readyRef.current) return;
     const total = systemEndsRef.current.length;
     const n = Math.max(1, nLinesRef.current);
     if (!total) return;
@@ -322,13 +334,55 @@ export default function ScoreOSMD({
       if (isPromise(maybe)) await maybe;
       osmd.render();
 
-      // initial compute/page (run immediately once)
+      // HUD container overlay
+      const hud = document.createElement("div");
+      hud.style.position = "absolute";
+      hud.style.right = "10px";
+      hud.style.bottom = "10px";
+      hud.style.padding = "6px 10px";
+      hud.style.background = "rgba(0,0,0,0.55)";
+      hud.style.color = "#fff";
+      hud.style.font = "12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      hud.style.borderRadius = "8px";
+      hud.style.pointerEvents = "none";
+      hudRef.current = hud;
+
+      const btnWrap = document.createElement("div");
+      btnWrap.style.position = "absolute";
+      btnWrap.style.right = "10px";
+      btnWrap.style.top = "10px";
+      btnWrap.style.display = "flex";
+      btnWrap.style.gap = "8px";
+
+      const mkBtn = (label:string, dir:number) => {
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.style.padding = "6px 10px";
+        b.style.borderRadius = "8px";
+        b.style.border = "1px solid #ccc";
+        b.style.background = "#fff";
+        b.style.cursor = "pointer";
+        b.onclick = () => { void changePage(dir); };
+        return b;
+      };
+      const prevBtn = mkBtn("Prev", -1);
+      const nextBtn = mkBtn("Next", 1);
+
+      // Make our container relatively positioned so overlays anchor correctly
+      const host = boxRef.current;
+      host.style.position = "relative";
+      host.appendChild(hud);
+      host.appendChild(btnWrap);
+      btnWrap.appendChild(prevBtn);
+      btnWrap.appendChild(nextBtn);
+
+      // initial compute/page (run immediately)
       startSystemRef.current = 0;
       currentRangeRef.current = { from:0, upTo:0 };
       readyRef.current = false;
       scheduleRecompute(true);
 
-      // ← FIXED TYPO: attach the real observer
+      // React to BOTH width and height changes
       if (!resizeObsRef.current) {
         resizeObsRef.current = new ResizeObserver(() => scheduleRecompute());
         resizeObsRef.current.observe(boxRef.current);
@@ -340,6 +394,10 @@ export default function ScoreOSMD({
       if (resizeObsRef.current && boxRef.current) resizeObsRef.current.unobserve(boxRef.current);
       resizeObsRef.current = null;
       if (osmdRef.current) { osmdRef.current.clear?.(); osmdRef.current.dispose?.(); osmdRef.current = null; }
+      // cleanup overlays
+      const host = boxRef.current;
+      if (host && hudRef.current?.parentNode === host) host.removeChild(hudRef.current);
+      hudRef.current = null;
     };
   }, [src]);
 
@@ -347,5 +405,11 @@ export default function ScoreOSMD({
     ? { width:"100%", height:"100%", minHeight:0, overflowY:"hidden", overflowX:"hidden" }
     : { width:"100%", height: height ?? 600, minHeight: height ?? 600, overflowY:"hidden", overflowX:"hidden" };
 
-  return <div ref={boxRef} className={`osmd-container ${className || ""}`} style={{ background:"#fff", ...containerStyle, ...style }} />;
+  return (
+    <div
+      ref={boxRef}
+      className={`osmd-container ${className || ""}`}
+      style={{ background:"#fff", ...containerStyle, ...style }}
+    />
+  );
 }
