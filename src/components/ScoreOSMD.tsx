@@ -53,7 +53,8 @@ export default function ScoreOSMD({
         });
 
         // Newer OSMD accepts raw XML strings; if yours doesn’t, swap to .load("/scores/…")
-        await osmd.load(TINY_XML);
+        //await osmd.load(TINY_XML);
+        await osmd.load("/scores/gymnopedie-no-1-satie.mxl")
         if (!disposed) await osmd.render();
 
         // Force a resize once more in case initial width was 0
