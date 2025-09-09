@@ -1,3 +1,4 @@
+// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -6,47 +7,52 @@ import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 /* Props */
 type Props = {
   src: string;
-  fillParent?: boolean;
-  height?: number;
+  fillParent?: boolean;   // occupy parent height
+  height?: number;        // if not fillParent
   className?: string;
   style?: React.CSSProperties;
-  allowScroll?: boolean;
+  allowScroll?: boolean;  // keep false (we page with wheel/keys)
 };
 
 /* Types */
 type Band = { top: number; bottom: number; height: number };
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
-/* Constants */
-const CONTROLS_H = 44;
-const OVERLAP_PX = 4;
+/* ---------- Constants ---------- */
+const CONTROLS_H = 44;           // fixed bottom bar height (px)
+const OVERLAP_PX = 4;            // bottom mask overlap
 const ZOOM_MIN = 0.6;
 const ZOOM_MAX = 2.0;
 const ZOOM_STEP = 0.01;
 const ZOOM_DEBOUNCE_MS = 180;
 
-/* Helpers */
+/* ---------- Helpers ---------- */
+
+/** wait two paints */
 const afterPaint = () =>
-  new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
 
 const isPromise = (x: unknown): x is Promise<unknown> =>
-  typeof x === "object" && x !== null && typeof (x as any).then === "function";
+  typeof x === "object" && x !== null && typeof (x as { then?: unknown }).then === "function";
 
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg");
 }
 
-/** Robustly find OSMD “systems” (lines) and measure them relative to wrapper */
+/** find OSMD systems (lines) and measure them relative to wrapper */
 function measureSystemsPx(outer: HTMLDivElement): Band[] {
   const svg = getSvg(outer);
   if (!svg) return [];
 
   const hostTop = outer.getBoundingClientRect().top;
 
-  // Prefer explicit system groups; fall back to page roots if needed.
+  // Prefer true system groups
   const sysGroups = Array.from(
     svg.querySelectorAll<SVGGElement>(
-      // case-insensitive “system” in id/class
       'g[id*="system" i], g[class*="system" i], g[id^="System"], g[id^="system"]'
     )
   );
@@ -54,21 +60,19 @@ function measureSystemsPx(outer: HTMLDivElement): Band[] {
   const targets: Element[] =
     sysGroups.length > 0
       ? sysGroups
-      : // fallback: big blocks under page groups (wide/tall)
-        Array.from(svg.querySelectorAll<SVGGElement>('g[id*="Page" i], g[class*="page" i]'));
+      : Array.from(svg.querySelectorAll<SVGGElement>('g[id*="Page" i], g[class*="page" i]'));
 
   const bands: Band[] = [];
   for (const el of targets) {
     const r = el.getBoundingClientRect();
     if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-    // Heuristics to ignore tiny/zero blocks
-    if (r.height < 12 || r.width < 80) continue;
+    if (r.height < 12 || r.width < 80) continue; // ignore tiny artifacts
     const top = r.top - hostTop;
     const bottom = r.bottom - hostTop;
     bands.push({ top, bottom, height: bottom - top });
   }
 
-  // If we selected page blocks, split them into likely lines by looking for large gaps.
+  // If we selected page blocks, merge into lines by gaps
   if (!sysGroups.length && bands.length) {
     bands.sort((a, b) => a.top - b.top);
     const merged: Band[] = [];
@@ -85,12 +89,11 @@ function measureSystemsPx(outer: HTMLDivElement): Band[] {
     return merged;
   }
 
-  // Systems already give one band per line; just sort.
   bands.sort((a, b) => a.top - b.top);
   return bands;
 }
 
-/** Build page starts so each page shows only full systems */
+/** page starts so each page shows only full systems */
 function computePageStarts(bands: Band[], viewportH: number): number[] {
   if (!bands.length || viewportH <= 0) return [0];
   const starts: number[] = [];
@@ -105,7 +108,8 @@ function computePageStarts(bands: Band[], viewportH: number): number[] {
   return starts.length ? starts : [0];
 }
 
-/* Component */
+/* ---------- Component ---------- */
+
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -117,26 +121,33 @@ export default function ScoreOSMD({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
 
+  // Layout state (in refs to avoid re-renders)
   const bandsRef = useRef<Band[]>([]);
   const pageStartsRef = useRef<number[]>([0]);
   const pageIdxRef = useRef<number>(0);
 
+  // UI state
   const [hud, setHud] = useState({ page: 1, pages: 1, zoomPct: 100 });
   const [zoom, setZoom] = useState<number>(1.0);
 
+  // guards/timers/observers
   const zoomTimerRef = useRef<number | null>(null);
   const isZoomingRef = useRef<boolean>(false);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
-  const getAvailH = useCallback(() => {
+  /** available height = wrapper minus controls bar */
+  const getAvailH = useCallback((): number => {
     const outer = wrapRef.current;
     return outer ? Math.max(0, outer.clientHeight - CONTROLS_H) : 0;
   }, []);
 
-  const getMaskEl = (): HTMLDivElement | null =>
-    wrapRef.current?.querySelector<HTMLDivElement>("[data-osmd-mask='1']") ?? null;
+  const getMaskEl = useCallback(
+    (): HTMLDivElement | null =>
+      wrapRef.current?.querySelector<HTMLDivElement>("[data-osmd-mask='1']") ?? null,
+    []
+  );
 
-  const ensureMask = (): HTMLDivElement | null => {
+  const ensureMask = useCallback((): HTMLDivElement | null => {
     const outer = wrapRef.current;
     if (!outer) return null;
     let mask = getMaskEl();
@@ -157,8 +168,9 @@ export default function ScoreOSMD({
       outer.appendChild(mask);
     }
     return mask;
-  };
+  }, [getMaskEl]);
 
+  /** translate SVG & set bottom mask so no partial next line shows */
   const applyPage = useCallback(
     (idx: number) => {
       const outer = wrapRef.current;
@@ -196,9 +208,10 @@ export default function ScoreOSMD({
 
       setHud({ page: page + 1, pages, zoomPct: Math.round(zoom * 100) });
     },
-    [getAvailH, zoom]
+    [ensureMask, getAvailH, zoom]
   );
 
+  /** only height changed → recompute pagination; keep nearest page */
   const repaginateHeightOnly = useCallback(() => {
     if (isZoomingRef.current) return;
     const bands = bandsRef.current;
@@ -213,7 +226,6 @@ export default function ScoreOSMD({
 
     pageStartsRef.current = newStarts;
 
-    // stay near previous top system
     let nearest = 0;
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < newStarts.length; i++) {
@@ -226,6 +238,7 @@ export default function ScoreOSMD({
     applyPage(nearest);
   }, [applyPage, getAvailH]);
 
+  /** width changed → full OSMD render, re-measure, keep place */
   const reflowOnWidthChange = useCallback(async () => {
     if (isZoomingRef.current) return;
     const outer = wrapRef.current;
@@ -264,15 +277,12 @@ export default function ScoreOSMD({
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < starts.length; i++) {
       const d = Math.abs(starts[i] - oldTop);
-      if (d < best) {
-        best = d;
-        nearest = i;
-      }
+      if (d < best) { best = d; nearest = i; }
     }
     applyPage(nearest);
   }, [applyPage, getAvailH]);
 
-  /* Init OSMD once per src */
+  /* ---------- Init OSMD once per src ---------- */
   useEffect(() => {
     let lastW = -1;
     let lastH = -1;
@@ -355,9 +365,9 @@ export default function ScoreOSMD({
         zoomTimerRef.current = null;
       }
     };
-  }, [applyPage, getAvailH, reflowOnWidthChange, repaginateHeightOnly, src]); // <-- no zoom here
+  }, [applyPage, getAvailH, reflowOnWidthChange, repaginateHeightOnly, src]); // <-- NO zoom here
 
-  /* Paging controls (wheel/keys) */
+  /* ---------- Paging controls (wheel/keys) ---------- */
   const goNext = useCallback(() => {
     const pages = pageStartsRef.current.length;
     const next = Math.min(pageIdxRef.current + 1, pages - 1);
@@ -393,7 +403,7 @@ export default function ScoreOSMD({
     };
   }, [applyPage, goNext, goPrev]);
 
-  /* Zoom (debounced, transactional) */
+  /* ---------- Zoom (debounced, transactional) ---------- */
   const scheduleApplyZoom = useCallback(
     (value: number) => {
       const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
@@ -434,11 +444,10 @@ export default function ScoreOSMD({
         } while (tries < 8);
 
         if (!bands.length) {
-          // abort safely
+          // abort safely (do not touch pagination)
           if (mask) mask.style.display = "block";
-          // reattach resize observer
-          const obs = resizeObsRef.current;
-          if (!obs && wrapRef.current) {
+          // reattach a minimal observer for future resizes
+          if (wrapRef.current) {
             const ro = new ResizeObserver(() => {});
             ro.observe(wrapRef.current);
             resizeObsRef.current = ro;
@@ -448,6 +457,7 @@ export default function ScoreOSMD({
         }
 
         bandsRef.current = bands;
+
         const availH = getAvailH();
         if (availH >= 40) {
           const starts = computePageStarts(bands, availH);
@@ -469,7 +479,6 @@ export default function ScoreOSMD({
         if (wrapRef.current) {
           const ro = new ResizeObserver(() => {
             if (isZoomingRef.current) return;
-            // only height change should repaginate
             repaginateHeightOnly();
           });
           ro.observe(wrapRef.current);
@@ -478,10 +487,11 @@ export default function ScoreOSMD({
         isZoomingRef.current = false;
       }, ZOOM_DEBOUNCE_MS);
     },
-    [applyPage, getAvailH, repaginateHeightOnly]
+    [applyPage, getAvailH, getMaskEl, repaginateHeightOnly]
   );
 
-  /* Styles */
+  /* ---------- Styles ---------- */
+
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden", background: "#fff" }
     : { width: "100%", height: height ?? 600, minHeight: height ?? 600, position: "relative", overflow: "hidden", background: "#fff" };
@@ -491,9 +501,9 @@ export default function ScoreOSMD({
     top: 0,
     left: 0,
     right: 0,
-    bottom: CONTROLS_H,
-    overflow: "hidden",
-    minWidth: 0,
+    bottom: CONTROLS_H,  // leave room for bottom bar
+    overflow: "hidden",  // no native vertical scroll
+    minWidth: 0,         // avoid horizontal scrollbar jiggle
   };
 
   const barStyle: React.CSSProperties = {
@@ -527,6 +537,8 @@ export default function ScoreOSMD({
   return (
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
       <div ref={hostRef} style={hostStyle} />
+
+      {/* Bottom control bar */}
       <div style={barStyle}>
         <div style={labelStyle}>Page {page}/{pages}</div>
         <div style={{ width: 10 }} />
