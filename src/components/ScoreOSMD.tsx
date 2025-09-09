@@ -1,18 +1,19 @@
 // src/components/ScoreOSMD.tsx
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
 /* Props */
 type Props = {
   src: string;
-  /** Occupy parent height by default; no need to pass from page.tsx */
+  /** Occupy parent height by default */
   fillParent?: boolean;     // default: true
   height?: number;          // used only if fillParent === false
   className?: string;
   style?: React.CSSProperties;
-  allowScroll?: boolean;    // if you ever want native scroll
+  /** One-time zoom applied before first render; fixed for the session */
+  initialZoom?: number;     // default: 1 (0.5..3 suggested)
 };
 
 /* Types */
@@ -105,11 +106,11 @@ function computePageStartIndices(bands: Band[], viewportH: number): number[] {
 
 export default function ScoreOSMD({
   src,
-  fillParent = true,       // << default to filling the parent
+  fillParent = true,
   height = 600,
   className = "",
   style,
-  allowScroll = false,
+  initialZoom = 1,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -120,9 +121,6 @@ export default function ScoreOSMD({
   const pageStartsRef = useRef<number[]>([0]); // indices into bands
   const pageIdxRef = useRef<number>(0);        // current page index
   const readyRef = useRef<boolean>(false);
-
-  // HUD
-  const [hud, setHud] = useState({ page: 1, pages: 1 });
 
   // Prevent WebGL warnings on some platforms
   function purgeWebGL(node: HTMLElement): void {
@@ -191,9 +189,6 @@ export default function ScoreOSMD({
         outer.appendChild(mask);
       }
       mask.style.top = `${maskTopPx}px`;
-
-      // HUD
-      setHud({ page: clampedPage + 1, pages });
     },
     []
   );
@@ -259,7 +254,7 @@ export default function ScoreOSMD({
     applyPage(nearest);
   }, [applyPage]);
 
-  /** Init OSMD and first layout */
+  /** Init OSMD and first layout (apply one-time initialZoom here) */
   useEffect(() => {
     let resizeObs: ResizeObserver | null = null;
     let lastW = -1;
@@ -288,6 +283,10 @@ export default function ScoreOSMD({
         drawLyricist: true,
       }) as OSMDWithLifecycle;
       osmdRef.current = osmd;
+
+      // One-time zoom before first render
+      const z = Math.max(0.5, Math.min(3, initialZoom ?? 1));
+      (osmd as any).Zoom = z;
 
       const maybe = osmd.load(src);
       if (isPromise(maybe)) await maybe;
@@ -320,15 +319,12 @@ export default function ScoreOSMD({
         lastH = h;
 
         if (widthChanged) {
-          // Width affects OSMD layout: re-render + re-measure + re-page.
           reflowOnWidthChange();
         } else if (heightChanged) {
-          // Height does NOT affect OSMD layout: only recompute pagination/mask.
           recomputePaginationHeightOnly();
         }
       });
       resizeObs.observe(outer);
-      // initialize lastW/H
       lastW = outer.clientWidth;
       lastH = outer.clientHeight;
     })().catch(() => {});
@@ -341,9 +337,10 @@ export default function ScoreOSMD({
         osmdRef.current = null;
       }
     };
-  }, [applyPage, recomputePaginationHeightOnly, reflowOnWidthChange, src]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyPage, recomputePaginationHeightOnly, reflowOnWidthChange, src, initialZoom]);
 
-  /** Paging controls */
+  /** Paging helpers */
   const goNext = useCallback(() => {
     const pages = pageStartsRef.current.length;
     if (!pages) return;
@@ -356,7 +353,7 @@ export default function ScoreOSMD({
     if (prev !== pageIdxRef.current) applyPage(prev);
   }, [applyPage]);
 
-  // Optional: wheel/keyboard paging
+  // Wheel & keyboard paging (desktop)
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -384,6 +381,58 @@ export default function ScoreOSMD({
     };
   }, [applyPage, goNext, goPrev]);
 
+  // Touch swipe paging (tablet/phone)
+  useEffect(() => {
+    const outer = wrapRef.current;
+    if (!outer) return;
+
+    let startY = 0;
+    let startX = 0;
+    let active = false;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (!readyRef.current || !e.touches.length) return;
+      active = true;
+      startY = e.touches[0].clientY;
+      startX = e.touches[0].clientX;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (!active || !readyRef.current) return;
+      // prevent native scroll to keep paging crisp
+      e.preventDefault();
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (!active) return;
+      active = false;
+      const t = e.changedTouches[0];
+      const dy = t.clientY - startY;
+      const dx = t.clientX - startX;
+
+      const THRESH = 40;      // min vertical travel
+      const H_RATIO = 0.6;    // ignore if mostly horizontal
+
+      if (Math.abs(dy) >= THRESH && Math.abs(dx) <= Math.abs(dy) * H_RATIO) {
+        if (dy < 0) goNext(); // swipe up → next page
+        else goPrev();        // swipe down → previous page
+      }
+    };
+
+    outer.addEventListener("touchstart", onTouchStart, { passive: true });
+    outer.addEventListener("touchmove", onTouchMove, { passive: false });
+    outer.addEventListener("touchend", onTouchEnd, { passive: true });
+
+    // reduce scroll chaining/bounce
+    outer.style.overscrollBehavior = "contain";
+
+    return () => {
+      outer.removeEventListener("touchstart", onTouchStart as any);
+      outer.removeEventListener("touchmove", onTouchMove as any);
+      outer.removeEventListener("touchend", onTouchEnd as any);
+    };
+  }, [goNext, goPrev]);
+
   /* ---------- Styles ---------- */
 
   const outerStyle: React.CSSProperties = fillParent
@@ -393,50 +442,14 @@ export default function ScoreOSMD({
   const hostStyle: React.CSSProperties = {
     position: "absolute",
     inset: 0,
-    overflow: "hidden",   // no native scroll; we page by buttons/wheel/keys
-    minWidth: 0,          // avoid horizontal scrollbar jiggle
+    overflow: "hidden",   // no native scroll; we page by wheel/keys/swipe
+    minWidth: 0,
   };
-
-  const btn: React.CSSProperties = {
-    padding: "6px 10px",
-    borderRadius: 8,
-    border: "1px solid #ccc",
-    background: "#fff",
-    cursor: "pointer",
-    fontWeight: 600,
-  };
-
-  // Live HUD from refs
-  const pages = pageStartsRef.current.length || 1;
-  const page = Math.min(pageIdxRef.current + 1, pages);
 
   return (
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
       <div ref={hostRef} style={hostStyle} />
-
-      {/* Controls */}
-      <div style={{ position: "absolute", right: 10, top: 10, display: "flex", gap: 8, zIndex: 10 }}>
-        <button type="button" style={btn} onClick={goPrev}>Prev</button>
-        <button type="button" style={btn} onClick={goNext}>Next</button>
-      </div>
-
-      {/* HUD */}
-      <div
-        style={{
-          position: "absolute",
-          right: 10,
-          bottom: 10,
-          padding: "6px 10px",
-          background: "rgba(0,0,0,0.55)",
-          color: "#fff",
-          borderRadius: 8,
-          font: "12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial",
-          zIndex: 10,
-          pointerEvents: "none",
-        }}
-      >
-        Page {page}/{pages}
-      </div>
+      {/* No buttons, no HUD — only gestures/keys/wheel */}
     </div>
   );
 }
