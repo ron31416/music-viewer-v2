@@ -1,4 +1,3 @@
-// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -128,6 +127,9 @@ export default function ScoreOSMD({
   const pageIdxRef = useRef<number>(0);        // current page index
   const readyRef = useRef<boolean>(false);
 
+  // Guards/state
+  const isZoomingRef = useRef<boolean>(false);
+
   // HUD
   const [hud, setHud] = useState({ page: 1, pages: 1, zoomPct: 100 });
 
@@ -155,6 +157,9 @@ export default function ScoreOSMD({
     if (!outer) return 0;
     return Math.max(0, outer.clientHeight - CONTROLS_H);
   }, []);
+
+  const getMaskEl = (): HTMLDivElement | null =>
+    wrapRef.current?.querySelector<HTMLDivElement>("[data-osmd-mask='1']") ?? null;
 
   /** Apply a page index: translate SVG & mask bottom so no partial next line shows */
   const applyPage = useCallback(
@@ -191,7 +196,7 @@ export default function ScoreOSMD({
       })();
 
       // Create/update mask
-      let mask = outer.querySelector<HTMLDivElement>("[data-osmd-mask='1']");
+      let mask = getMaskEl();
       if (!mask) {
         mask = document.createElement("div");
         mask.dataset.osmdMask = "1";
@@ -208,6 +213,7 @@ export default function ScoreOSMD({
         outer.appendChild(mask);
       }
       // anchor the mask’s top based on usable height
+      mask.style.display = "block";
       mask.style.top = `${maskTopPx}px`;
 
       // HUD
@@ -218,13 +224,13 @@ export default function ScoreOSMD({
 
   /** Recompute pagination when only height changed (keep current page if possible) */
   const recomputePaginationHeightOnly = useCallback(() => {
+    if (isZoomingRef.current) return; // ignore height noise while zooming
     const outer = wrapRef.current;
     if (!outer) return;
     const bands = bandsRef.current;
     if (!bands.length) return;
 
     const availH = getAvailableHeight();
-    // Guard: if height is unrealistically small (e.g., mid-zoom/layout), skip this tick
     if (availH < 40) return;
 
     const starts = computePageStartIndices(bands, availH);
@@ -247,20 +253,19 @@ export default function ScoreOSMD({
     applyPage(nearest);
   }, [applyPage, getAvailableHeight]);
 
-  /** Full reflow: width OR zoom changed → re-render OSMD, re-measure bands, recompute pages, keep nearest */
-  const reflowAfterEngravingChange = useCallback(async () => {
+  /** Full reflow used by width change; kept for completeness */
+  const reflowOnWidthChange = useCallback(async () => {
+    if (isZoomingRef.current) return;
     const outer = wrapRef.current;
     const osmd = osmdRef.current;
     if (!outer || !osmd) return;
 
-    // Remember which system index was at the top (by current page start index)
     const oldStarts = pageStartsRef.current;
     const oldPage = pageIdxRef.current;
     const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
     osmd.render();
     await afterPaint();
-    // Extra frame to let SVG settle size after zoom
     await afterPaint();
 
     const newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
@@ -268,20 +273,16 @@ export default function ScoreOSMD({
     bandsRef.current = newBands;
 
     const availH = getAvailableHeight();
-    if (availH < 40) return; // stability guard
+    if (availH < 40) return;
 
     const newStarts = computePageStartIndices(newBands, availH);
     pageStartsRef.current = newStarts;
 
-    // Find page whose start system index is closest to the previous top system
     let nearest = 0;
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < newStarts.length; i++) {
       const d = Math.abs(newStarts[i] - oldTopSystem);
-      if (d < best) {
-        best = d;
-        nearest = i;
-      }
+      if (d < best) { best = d; nearest = i; }
     }
     applyPage(nearest);
   }, [applyPage, getAvailableHeight]);
@@ -330,7 +331,7 @@ export default function ScoreOSMD({
       // Pages & first page
       pageStartsRef.current = computePageStartIndices(bands, getAvailableHeight());
       pageIdxRef.current = 0;
-      setHud((h) => ({ ...h, zoomPct: Math.round(zoom * 100) }));
+      setHud((h) => ({ ...h, zoomPct: Math.round(100) }));
       applyPage(0);
 
       readyRef.current = true;
@@ -350,7 +351,7 @@ export default function ScoreOSMD({
         lastH = h;
 
         if (widthChanged) {
-          reflowAfterEngravingChange();
+          reflowOnWidthChange();
         } else if (heightChanged) {
           recomputePaginationHeightOnly();
         }
@@ -373,7 +374,7 @@ export default function ScoreOSMD({
         zoomApplyTimerRef.current = null;
       }
     };
-  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowAfterEngravingChange, src]);
+  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowOnWidthChange, src]); // ← no zoom here
 
   /** Wheel/keyboard paging */
   const goNext = useCallback(() => {
@@ -415,65 +416,77 @@ export default function ScoreOSMD({
     };
   }, [applyPage, goNext, goPrev]);
 
-  /** Zoom: debounce, set osmd.zoom, render, re-measure, keep nearest page */
+  /** Zoom: debounce, transactional reflow, keep place, suppress side-effects */
   const scheduleApplyZoom = useCallback(
     (value: number) => {
       const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
       setZoom(clamped);
       setHud((h) => ({ ...h, zoomPct: Math.round(clamped * 100) }));
+
       if (zoomApplyTimerRef.current) {
         clearTimeout(zoomApplyTimerRef.current);
         zoomApplyTimerRef.current = null;
       }
-    zoomApplyTimerRef.current = window.setTimeout(async () => {
-      zoomApplyTimerRef.current = null;
-      const osmd = osmdRef.current;
-      if (!osmd) return;
 
-      // remember current top system by page start
-      const oldStarts = pageStartsRef.current;
-      const oldPage = pageIdxRef.current;
-      const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+      zoomApplyTimerRef.current = window.setTimeout(async () => {
+        const osmd = osmdRef.current;
+        const outer = wrapRef.current;
+        if (!osmd || !outer) return;
 
-      osmd.zoom = clamped;
-      osmd.render();
+        // Guard: enter zooming mode (suspend pagination/resize; hide mask to avoid whiteout)
+        isZoomingRef.current = true;
+        const mask = getMaskEl();
+        if (mask) mask.style.display = "none";
 
-      // wait at least 2 frames to let SVG update
-      await afterPaint();
-      await afterPaint();
+        // remember current top system by page start
+        const oldStarts = pageStartsRef.current;
+        const oldPage = pageIdxRef.current;
+        const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
-      const outer = wrapRef.current;
-      if (!outer) return;
+        // Apply zoom and re-engrave
+        osmd.zoom = clamped;
+        osmd.render();
 
-      let newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
-      if (!newBands.length) {
-        // retry once if SVG wasn't ready
+        // Give the SVG time to settle
         await afterPaint();
-        newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
-      }
-      if (!newBands.length) {
-        console.warn("Zoom reflow: no systems measured, skipping update");
-        return;
-      }
+        await afterPaint();
 
-      bandsRef.current = newBands;
-      const availH = getAvailableHeight();
-      if (availH < 40) return;
+        // Measure (retry once if empty)
+        let newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
+        if (!newBands.length) {
+          await afterPaint();
+          newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
+        }
+        if (!newBands.length) {
+          // Exit gracefully without changing paging
+          isZoomingRef.current = false;
+          if (mask) mask.style.display = "block";
+          return;
+        }
 
-      const newStarts = computePageStartIndices(newBands, availH);
-      pageStartsRef.current = newStarts;
+        bandsRef.current = newBands;
 
-      // Snap back to nearest previous system
-      let nearest = 0;
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < newStarts.length; i++) {
-        const d = Math.abs(newStarts[i] - oldTopSystem);
-        if (d < best) { best = d; nearest = i; }
-      }
-      applyPage(nearest);
-    }, ZOOM_DEBOUNCE_MS);
+        const availH = getAvailableHeight();
+        if (availH >= 40) {
+          const newStarts = computePageStartIndices(newBands, availH);
+          pageStartsRef.current = newStarts;
+
+          // Snap back to nearest previous system
+          let nearest = 0;
+          let best = Number.POSITIVE_INFINITY;
+          for (let i = 0; i < newStarts.length; i++) {
+            const d = Math.abs(newStarts[i] - oldTopSystem);
+            if (d < best) { best = d; nearest = i; }
+          }
+          applyPage(nearest);
+        }
+
+        // Leave zooming mode
+        isZoomingRef.current = false;
+        if (mask) mask.style.display = "block";
+      }, ZOOM_DEBOUNCE_MS);
     },
-    [reflowAfterEngravingChange]
+    [applyPage, getAvailableHeight]
   );
 
   /* ---------- Styles ---------- */
@@ -514,9 +527,7 @@ export default function ScoreOSMD({
     whiteSpace: "nowrap",
   };
 
-  const sliderStyle: React.CSSProperties = {
-    flex: 1,
-  };
+  const sliderStyle: React.CSSProperties = { flex: 1 };
 
   // Live HUD from refs
   const pages = pageStartsRef.current.length || 1;
