@@ -20,7 +20,7 @@ type ScoreOSMDProps = {
   viewportHeightPx?: number;
 };
 
-type Page = { start: number; end: number };
+type Page = { start: number; end: number; topY: number; bottomY: number };
 
 export default function ScoreOSMD({
   src,
@@ -29,8 +29,8 @@ export default function ScoreOSMD({
   style,
   viewportHeightPx,
 }: ScoreOSMDProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);   // overflow-hidden window
+  const containerRef = useRef<HTMLDivElement | null>(null);  // OSMD mounts <svg> here
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
 
   const [ready, setReady] = useState(false);
@@ -38,76 +38,101 @@ export default function ScoreOSMD({
   const [pageIndex, setPageIndex] = useState(0);
 
   /**
-   * Compute pages from system heights, reserving footer space and bleed margin
-   * so the next line never shows.
+   * Measure systems and build pages.
+   * We reserve footer space and add a small "bleed" so ornaments/slurs don’t peek.
+   * Instead of hiding systems, we’ll window the SVG via translateY.
    */
   const computePages = useCallback((): Page[] => {
-    const svgRoot = containerRef.current?.querySelector("svg");
-    if (!svgRoot) return [];
+    const svg = containerRef.current?.querySelector("svg");
+    if (!svg) return [];
 
-    const systems = Array.from(svgRoot.querySelectorAll<SVGGElement>("g.system"));
+    // OSMD systems are grouped; use a broad selector to be robust across versions
+    const systems = Array.from(
+      svg.querySelectorAll<SVGGElement>("g.system, g.graphical-measuresystem, g[id^='system-']")
+    );
     if (!systems.length) return [];
 
-    // Reserve space for footer (solid bar) and extra bleed margin
     const footerPx = showControls ? 44 : 0;
-    const bleedPx = 8; // extra margin to prevent slur/beam peeking
+    const bleedPx = 10;
 
-    // Figure available height:
+    // available window height
     const measured = viewportRef.current?.clientHeight ?? 0;
-    // If no measurement yet, fall back to window height
     const parentOrWindow =
       viewportHeightPx ??
       (measured > 0 ? measured : (typeof window !== "undefined" ? window.innerHeight : 900));
-    const usable = Math.max(1, parentOrWindow - footerPx - bleedPx);
+    const vh = Math.max(1, parentOrWindow - footerPx - bleedPx);
 
-    const heights = systems.map((g) => g.getBBox().height);
+    // Build per-system geometry
+    const sys = systems.map((g) => {
+      const bb = g.getBBox(); // SVG units; effectively pixels here
+      return { g, y: bb.y, h: bb.height, bottom: bb.y + bb.height };
+    });
 
-    const next: Page[] = [];
-    let start = 0;
+    // Sort by y just in case (top to bottom)
+    sys.sort((a, b) => a.y - b.y);
+
+    // Paginate by stacking systems until we’d overflow vh
+    const pagesNext: Page[] = [];
+    let startIdx = 0;
     let acc = 0;
 
-    for (let i = 0; i < heights.length; i++) {
-      const h = heights[i];
+    for (let i = 0; i < sys.length; i++) {
+      const h = sys[i].h;
 
-      // If adding this system would overflow the usable height, close the page
-      if (acc > 0 && acc + h > usable) {
-        next.push({ start, end: i - 1 });
-        start = i;
+      if (acc > 0 && acc + h > vh) {
+        const topY = sys[startIdx].y;
+        const bottomY = sys[i - 1].bottom;
+        pagesNext.push({ start: startIdx, end: i - 1, topY, bottomY });
+        startIdx = i;
         acc = 0;
       }
       acc += h;
 
-      // Very tall single system → its own page
-      if (h > usable) {
-        if (acc !== h) next.push({ start, end: i - 1 });
-        next.push({ start: i, end: i });
-        start = i + 1;
+      if (h > vh) {
+        // Single very tall line: its own page
+        if (acc !== h) {
+          const topY = sys[startIdx].y;
+          const bottomY = sys[i - 1].bottom;
+          pagesNext.push({ start: startIdx, end: i - 1, topY, bottomY });
+        }
+        pagesNext.push({ start: i, end: i, topY: sys[i].y, bottomY: sys[i].bottom });
+        startIdx = i + 1;
         acc = 0;
       }
     }
 
-    if (start < heights.length) next.push({ start, end: heights.length - 1 });
-    return next;
+    if (startIdx < sys.length) {
+      const topY = sys[startIdx].y;
+      const bottomY = sys[sys.length - 1].bottom;
+      pagesNext.push({ start: startIdx, end: sys.length - 1, topY, bottomY });
+    }
+
+    return pagesNext;
   }, [viewportHeightPx, showControls]);
 
-  /** Mask: show only systems in current page. */
-  const applyPageVisibility = useCallback((page: Page | null) => {
-    const svgRoot = containerRef.current?.querySelector("svg");
-    if (!svgRoot) return;
+  /**
+   * Apply the "window": translate the SVG upward so that the current page's top aligns with the viewport.
+   * The viewport itself is overflow-hidden, so nothing else shows.
+   */
+  const applyWindow = useCallback(
+    (page: Page | null) => {
+      const svg = containerRef.current?.querySelector<SVGSVGElement>("svg");
+      if (!svg) return;
 
-    const systems = Array.from(svgRoot.querySelectorAll<SVGGElement>("g.system"));
-    if (!systems.length) return;
+      if (!page) {
+        svg.style.transform = "";
+        svg.style.willChange = "";
+        return;
+      }
 
-    if (!page) {
-      systems.forEach((g) => (g.style.display = ""));
-      return;
-    }
-    systems.forEach((g, idx) => {
-      g.style.display = idx >= page.start && idx <= page.end ? "" : "none";
-    });
-  }, []);
+      // Slide the SVG up so that page.topY is at the top edge
+      svg.style.transform = `translateY(${-page.topY}px)`;
+      svg.style.willChange = "transform";
+    },
+    []
+  );
 
-  /** Initialize OSMD; compute pages after render + next frame (so BBoxes are measurable). */
+  /** Initialize OSMD and compute pages after render + next frame. */
   useEffect(() => {
     let cancelled = false;
 
@@ -116,7 +141,7 @@ export default function ScoreOSMD({
 
       const options: Partial<IOSMDOptions> = {
         backend: "svg",
-        autoResize: false, // we control renders for stability
+        autoResize: false, // we control re-renders to avoid races
         drawTitle: true,
       };
 
@@ -125,10 +150,11 @@ export default function ScoreOSMD({
 
       try {
         await osmd.load(src);
-        // Keep default zoom. No zoom UI in this build.
+        // Keep default Zoom (1.0). No zoom UI in this build.
         osmd.render();
         if (cancelled) return;
 
+        // Defer to next frame so <svg> and clientHeight are ready
         requestAnimationFrame(() => {
           const nextPages = computePages();
           setPages(nextPages);
@@ -146,20 +172,19 @@ export default function ScoreOSMD({
     };
   }, [src, computePages]);
 
-  /** Apply masking whenever page changes. */
+  /** When pages/index change, slide to the correct band. */
   useLayoutEffect(() => {
     if (!pages.length) return;
     const clamped = Math.max(0, Math.min(pageIndex, pages.length - 1));
-    applyPageVisibility(pages[clamped] ?? null);
-  }, [pages, pageIndex, applyPageVisibility]);
+    applyWindow(pages[clamped] ?? null);
+  }, [pages, pageIndex, applyWindow]);
 
-  /** Re-paginate on resize (render sync, measure next frame). */
+  /** Recompute pagination on resize; measure on next frame; keep current page if possible. */
   useEffect(() => {
     const onResize = () => {
       if (!osmdRef.current) return;
 
       osmdRef.current.render();
-
       requestAnimationFrame(() => {
         const next = computePages();
         setPages(next);
@@ -199,20 +224,19 @@ export default function ScoreOSMD({
         ...style,
       }}
     >
-      {/* Viewport */}
+      {/* Viewport: overflow-hidden window */}
       <div
         ref={viewportRef}
         style={{
           position: "relative",
           overflow: "hidden",
-          // Fill parent by default
           height: viewportHeightPx ? `${viewportHeightPx}px` : "100%",
           width: "100%",
           background: "white",
         }}
       >
-        {/* OSMD attaches its SVG here */}
-        <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+        {/* OSMD mounts its <svg> inside this container */}
+        <div ref={containerRef} style={{ width: "100%", height: "auto" }} />
 
         {!ready && (
           <div
@@ -223,13 +247,14 @@ export default function ScoreOSMD({
               placeItems: "center",
               fontSize: 14,
               color: "#666",
+              background: "white",
             }}
           >
             Loading score…
           </div>
         )}
 
-        {/* Bottom status bar (SOLID background; no transparency) */}
+        {/* Bottom status bar (solid) */}
         {showControls && (
           <div
             style={{
@@ -242,7 +267,7 @@ export default function ScoreOSMD({
               alignItems: "center",
               gap: 12,
               padding: "8px 10px",
-              background: "#fff",           // solid white, nothing shows through
+              background: "#fff",
               borderTop: "1px solid #ddd",
               fontSize: 13,
             }}
