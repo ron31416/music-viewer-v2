@@ -18,6 +18,15 @@ type Props = {
 type Band = { top: number; bottom: number; height: number };
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
+/* ---------- Constants ---------- */
+const CONTROLS_H = 44;           // fixed bottom bar height (px)
+const OVERLAP_PX = 4;            // bottom mask overlap
+const GAP_PX = 18;               // system clustering gap
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 2.0;
+const ZOOM_STEP = 0.01;
+const ZOOM_DEBOUNCE_MS = 180;
+
 /* ---------- Helpers ---------- */
 
 const afterPaint = () =>
@@ -70,11 +79,10 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
 
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px between systems
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
-    if (!last || b.top - last.bottom > GAP) {
+    if (!last || b.top - last.bottom > GAP_PX) {
       bands.push({ top: b.top, bottom: b.bottom, height: b.height });
     } else {
       last.top = Math.min(last.top, b.top);
@@ -112,7 +120,6 @@ export default function ScoreOSMD({
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const controlsRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
 
   // Layout model
@@ -127,10 +134,6 @@ export default function ScoreOSMD({
   // Zoom
   const [zoom, setZoom] = useState<number>(1.0);     // 1.00 = 100%
   const zoomApplyTimerRef = useRef<number | null>(null);
-  const ZOOM_MIN = 0.6;
-  const ZOOM_MAX = 2.0;
-  const ZOOM_STEP = 0.01;
-  const ZOOM_DEBOUNCE_MS = 180;
 
   // Prevent WebGL warnings on some platforms
   function purgeWebGL(node: HTMLElement): void {
@@ -146,13 +149,11 @@ export default function ScoreOSMD({
     }
   }
 
-  /** Available vertical space = wrapper height minus controls bar height */
+  /** Available vertical space = wrapper height minus fixed controls bar height */
   const getAvailableHeight = useCallback((): number => {
     const outer = wrapRef.current;
-    const controls = controlsRef.current;
     if (!outer) return 0;
-    const ch = controls?.offsetHeight ?? 0;
-    return Math.max(0, outer.clientHeight - ch);
+    return Math.max(0, outer.clientHeight - CONTROLS_H);
   }, []);
 
   /** Apply a page index: translate SVG & mask bottom so no partial next line shows */
@@ -186,8 +187,7 @@ export default function ScoreOSMD({
       const maskTopPx = (() => {
         if (nextStartIndex < 0) return availH;
         const nextTopRel = bands[nextStartIndex].top - startTop;
-        const overlap = 4; // px
-        return Math.min(availH - 1, Math.max(0, Math.ceil(nextTopRel - overlap)));
+        return Math.min(availH - 1, Math.max(0, Math.ceil(nextTopRel - OVERLAP_PX)));
       })();
 
       // Create/update mask
@@ -224,6 +224,9 @@ export default function ScoreOSMD({
     if (!bands.length) return;
 
     const availH = getAvailableHeight();
+    // Guard: if height is unrealistically small (e.g., mid-zoom/layout), skip this tick
+    if (availH < 40) return;
+
     const starts = computePageStartIndices(bands, availH);
     const oldStarts = pageStartsRef.current;
     pageStartsRef.current = starts;
@@ -257,12 +260,16 @@ export default function ScoreOSMD({
 
     osmd.render();
     await afterPaint();
+    // Extra frame to let SVG settle size after zoom
+    await afterPaint();
 
     const newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     if (!newBands.length) return;
     bandsRef.current = newBands;
 
     const availH = getAvailableHeight();
+    if (availH < 40) return; // stability guard
+
     const newStarts = computePageStartIndices(newBands, availH);
     pageStartsRef.current = newStarts;
 
@@ -282,7 +289,6 @@ export default function ScoreOSMD({
   /** Init OSMD and first layout */
   useEffect(() => {
     let resizeObs: ResizeObserver | null = null;
-    let controlsObs: ResizeObserver | null = null;
     let lastW = -1;
     let lastH = -1;
 
@@ -332,8 +338,10 @@ export default function ScoreOSMD({
       // Observe wrapper size; only re-render on width changes; height triggers pagination only.
       resizeObs = new ResizeObserver(() => {
         if (!readyRef.current) return;
-        const w = outer.clientWidth;
-        const h = outer.clientHeight;
+        const outerNow = wrapRef.current;
+        if (!outerNow) return;
+        const w = outerNow.clientWidth;
+        const h = outerNow.clientHeight;
 
         const widthChanged = lastW !== -1 && Math.abs(w - lastW) >= 1;
         const heightChanged = lastH !== -1 && Math.abs(h - lastH) >= 1;
@@ -351,21 +359,10 @@ export default function ScoreOSMD({
       // initialize lastW/H
       lastW = outer.clientWidth;
       lastH = outer.clientHeight;
-
-      // Observe controls bar height (so it never covers the score)
-      if (controlsRef.current) {
-        controlsObs = new ResizeObserver(() => {
-          if (!readyRef.current) return;
-          // controls height changed -> only pagination/mask needs update
-          recomputePaginationHeightOnly();
-        });
-        controlsObs.observe(controlsRef.current);
-      }
     })().catch(() => {});
 
     return () => {
       if (resizeObs && wrapRef.current) resizeObs.unobserve(wrapRef.current);
-      if (controlsObs && controlsRef.current) controlsObs.unobserve(controlsRef.current);
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -421,8 +418,9 @@ export default function ScoreOSMD({
   /** Zoom: debounce, set osmd.zoom, render, re-measure, keep nearest page */
   const scheduleApplyZoom = useCallback(
     (value: number) => {
-      setZoom(value);
-      setHud((h) => ({ ...h, zoomPct: Math.round(value * 100) }));
+      const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
+      setZoom(clamped);
+      setHud((h) => ({ ...h, zoomPct: Math.round(clamped * 100) }));
       if (zoomApplyTimerRef.current) {
         clearTimeout(zoomApplyTimerRef.current);
         zoomApplyTimerRef.current = null;
@@ -431,16 +429,16 @@ export default function ScoreOSMD({
         zoomApplyTimerRef.current = null;
         const osmd = osmdRef.current;
         if (!osmd) return;
+
         // remember current top system by page start
         const oldStarts = pageStartsRef.current;
         const oldPage = pageIdxRef.current;
         const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
-        osmd.zoom = value;
+        osmd.zoom = clamped;
         await reflowAfterEngravingChange();
 
-        // Ensure we kept place (reflowAfterEngravingChange already maps by top system)
-        // No extra work needed here.
+        // place is preserved inside reflowAfterEngravingChange
       }, ZOOM_DEBOUNCE_MS);
     },
     [reflowAfterEngravingChange]
@@ -457,10 +455,9 @@ export default function ScoreOSMD({
     top: 0,
     left: 0,
     right: 0,
-    // bottom is reserved by controls bar; we let the mask account for it, so keep host full:
-    bottom: 0,
-    overflow: "hidden",   // no native vertical scroll
-    minWidth: 0,          // avoid horizontal scrollbar jiggle
+    bottom: CONTROLS_H,  // leave room for bottom bar
+    overflow: "hidden",  // no native vertical scroll
+    minWidth: 0,         // avoid horizontal scrollbar jiggle
   };
 
   const barStyle: React.CSSProperties = {
@@ -468,7 +465,7 @@ export default function ScoreOSMD({
     left: 0,
     right: 0,
     bottom: 0,
-    height: 44,                          // fixed bar height (observed by ResizeObserver)
+    height: CONTROLS_H,
     display: "flex",
     alignItems: "center",
     gap: 12,
@@ -497,8 +494,8 @@ export default function ScoreOSMD({
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
       <div ref={hostRef} style={hostStyle} />
 
-      {/* Bottom control bar (never covers score; we subtract its height in calculations) */}
-      <div ref={controlsRef} style={barStyle}>
+      {/* Bottom control bar (fixed height; pagination subtracts this) */}
+      <div style={barStyle}>
         <div style={labelStyle}>Page {page}/{pages}</div>
         <div style={{ width: 10 }} />
         <div style={labelStyle}>Zoom {hud.zoomPct}%</div>
