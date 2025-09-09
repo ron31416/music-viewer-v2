@@ -39,12 +39,12 @@ function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
 function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
   const svg = getSvg(outer);
   if (!svg) return null;
-  const prev = (svg.style && svg.style.transform) || "";
-  (svg.style as CSSStyleDeclaration).transform = "none";
+  const prev = svg.style.transform;
+  svg.style.transform = "none";
   try {
     return fn(svg);
   } finally {
-    (svg.style as CSSStyleDeclaration).transform = prev;
+    svg.style.transform = prev;
   }
 }
 
@@ -122,23 +122,6 @@ export default function ScoreOSMD({
   const pageIdxRef = useRef<number>(0);        // current page index
   const readyRef = useRef<boolean>(false);
 
-  // Prevent WebGL warnings on some platforms
-  function purgeWebGL(node: HTMLElement): void {
-    for (const c of Array.from(node.querySelectorAll("canvas"))) {
-      try {
-        const gl =
-          (c.getContext("webgl") as WebGLRenderingContext | null) ||
-          (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
-          (c.getContext("webgl2") as WebGL2RenderingContext | null);
-        const ext = gl?.getExtension("WEBGL_lose_context") as { loseContext?: () => void } | null;
-        ext?.loseContext?.();
-        c.remove();
-      } catch {
-        /* noop */
-      }
-    }
-  }
-
   /** Apply a page index: translate SVG & mask bottom so no partial next line shows */
   const applyPage = useCallback((pageIdx: number) => {
     const outer = wrapRef.current;
@@ -161,8 +144,8 @@ export default function ScoreOSMD({
 
     // Snap first visible system to top
     const ySnap = Math.ceil(startTop);
-    (svg.style as CSSStyleDeclaration).transform = `translateY(${-ySnap}px)`;
-    (svg.style as CSSStyleDeclaration).willChange = "transform";
+    svg.style.transform = `translateY(${-ySnap}px)`;
+    svg.style.willChange = "transform";
 
     // Bottom mask: from top of next page's first system (minus tiny overlap)
     const maskTopPx = (() => {
@@ -178,16 +161,15 @@ export default function ScoreOSMD({
     if (!mask) {
       mask = document.createElement("div");
       mask.dataset.osmdMask = "1";
-      Object.assign(mask.style, {
-        position: "absolute",
-        left: "0",
-        right: "0",
-        top: "0",
-        bottom: "0",
-        background: "#fff",
-        pointerEvents: "none",
-        zIndex: "5",
-      } as CSSStyleDeclaration);
+      // set styles without casts
+      mask.style.position = "absolute";
+      mask.style.left = "0";
+      mask.style.right = "0";
+      mask.style.top = "0";
+      mask.style.bottom = "0";
+      mask.style.background = "#fff";
+      mask.style.pointerEvents = "none";
+      mask.style.zIndex = "5";
       outer.appendChild(mask);
     }
     mask.style.top = `${maskTopPx}px`;
@@ -254,9 +236,27 @@ export default function ScoreOSMD({
     applyPage(nearest);
   }, [applyPage]);
 
+  // Prevent WebGL warnings on some platforms
+  function purgeWebGL(node: HTMLElement): void {
+    for (const c of Array.from(node.querySelectorAll("canvas"))) {
+      try {
+        const gl =
+          (c.getContext("webgl") as WebGLRenderingContext | null) ||
+          (c.getContext("experimental-webgl") as WebGLRenderingContext | null) ||
+          (c.getContext("webgl2") as WebGL2RenderingContext | null);
+        (gl?.getExtension("WEBGL_lose_context") as { loseContext?: () => void } | null)?.loseContext?.();
+        c.remove();
+      } catch {
+        /* noop */
+      }
+    }
+  }
+
   /** Init OSMD and first layout (apply one-time initialZoom here) */
   useEffect(() => {
     let resizeObs: ResizeObserver | null = null;
+    let lastW = -1;
+    let lastH = -1;
 
     (async () => {
       const host = hostRef.current;
@@ -282,7 +282,7 @@ export default function ScoreOSMD({
       }) as OSMDWithLifecycle;
       osmdRef.current = osmd;
 
-      // One-time zoom before first render (no "any")
+      // One-time zoom before first render (without 'any')
       const z = Math.max(0.5, Math.min(3, initialZoom ?? 1));
       (osmd as unknown as { Zoom: number }).Zoom = z;
 
@@ -302,33 +302,35 @@ export default function ScoreOSMD({
       pageIdxRef.current = 0;
       applyPage(0);
 
+      readyRef.current = true;
+
       // Observe wrapper size; only re-render on width changes.
       resizeObs = new ResizeObserver(() => {
+        if (!readyRef.current) return;
         const w = outer.clientWidth;
         const h = outer.clientHeight;
 
-        // If width changed: reflow OSMD and recompute bands/pages.
-        // If only height changed: recompute pagination/mask only.
-        // We don't need to track previous w/h here—the OSMD re-render is idempotent.
-        // (If you prefer, you can store the last w/h in refs to skip identical calls.)
-        osmd.render();
-        requestAnimationFrame(() => {
-          const nextBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
-          if (nextBands.length) {
-            bandsRef.current = nextBands;
-            pageStartsRef.current = computePageStartIndices(nextBands, h);
-            // keep current page index bounded
-            const maxPage = Math.max(0, pageStartsRef.current.length - 1);
-            const clamped = Math.min(pageIdxRef.current, maxPage);
-            applyPage(clamped);
-          }
-        });
+        const widthChanged  = lastW !== -1 && Math.abs(w - lastW) >= 1;
+        const heightChanged = lastH !== -1 && Math.abs(h - lastH) >= 1;
+
+        lastW = w;
+        lastH = h;
+
+        if (widthChanged) {
+          // Width affects OSMD layout: re-render + re-measure + re-page.
+          reflowOnWidthChange();
+        } else if (heightChanged) {
+          // Height does NOT affect OSMD layout: only recompute pagination/mask.
+          recomputePaginationHeightOnly();
+        }
       });
       resizeObs.observe(outer);
+      // initialize lastW/H
+      lastW = outer.clientWidth;
+      lastH = outer.clientHeight;
     })().catch(() => {});
 
-    // capture current outer for cleanup to avoid ref-change warning
-    const cleanupOuter = wrapRef.current;
+    const cleanupOuter = wrapRef.current; // capture current for cleanup
 
     return () => {
       if (resizeObs && cleanupOuter) resizeObs.unobserve(cleanupOuter);
@@ -338,9 +340,9 @@ export default function ScoreOSMD({
         osmdRef.current = null;
       }
     };
-  }, [applyPage, initialZoom, src]);
+  }, [applyPage, recomputePaginationHeightOnly, reflowOnWidthChange, src, initialZoom]);
 
-  /** Paging helpers (used by wheel/keys/swipe) */
+  /** Paging helpers */
   const goNext = useCallback(() => {
     const pages = pageStartsRef.current.length;
     if (!pages) return;
@@ -373,10 +375,8 @@ export default function ScoreOSMD({
         applyPage(last);
       }
     };
-
     window.addEventListener("wheel", onWheel, { passive: false });
     window.addEventListener("keydown", onKey);
-
     return () => {
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKey);
@@ -393,14 +393,14 @@ export default function ScoreOSMD({
     let active = false;
 
     const onTouchStart = (e: TouchEvent) => {
-      if (!e.touches.length) return;
+      if (!readyRef.current || !e.touches.length) return;
       active = true;
       startY = e.touches[0].clientY;
       startX = e.touches[0].clientX;
     };
 
     const onTouchMove = (e: TouchEvent) => {
-      if (!active) return;
+      if (!active || !readyRef.current) return;
       // prevent native scroll to keep paging crisp
       e.preventDefault();
     };
@@ -428,7 +428,6 @@ export default function ScoreOSMD({
     // reduce scroll chaining/bounce
     outer.style.overscrollBehavior = "contain";
 
-    // cleanup uses captured element to avoid ref-change warning
     const cleanupOuter = outer;
     return () => {
       cleanupOuter.removeEventListener("touchstart", onTouchStart);
