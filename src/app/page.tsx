@@ -6,16 +6,16 @@ export default function Page() {
   return (
     <main
       style={{
-        height: "100dvh",     // full viewport height, mobile-safe
-        width: "100vw",       // ensure full width
-        overflow: "hidden",   // no page-level scrollbars
+        height: "100dvh",   // full viewport height (mobile-safe)
+        width: "100vw",
+        overflow: "hidden",
       }}
     >
       <div
         style={{
-          height: "100%",
+          height: "100%",   // parent container to hold the viewer
           width: "100%",
-          overflow: "hidden", // we’ll scroll only inside the viewer
+          overflow: "hidden",
         }}
       >
         <ScoreOSMD src={SCORE_SRC} />
