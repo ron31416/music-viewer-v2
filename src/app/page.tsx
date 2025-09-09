@@ -18,7 +18,7 @@ export default function Page() {
           overflow: "hidden", // we’ll scroll only inside the viewer
         }}
       >
-        <ScoreOSMD src={SCORE_SRC} fillParent />
+        <ScoreOSMD src={SCORE_SRC} />
       </div>
     </main>
   );

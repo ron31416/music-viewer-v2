@@ -16,7 +16,7 @@ type ScoreOSMDProps = {
   showControls?: boolean;
   className?: string;
   style?: CSSProperties;
-  viewportHeightPx?: number;
+  viewportHeightPx?: number; // optional override
 };
 
 type Page = { start: number; end: number };
@@ -150,7 +150,7 @@ export default function ScoreOSMD({
 
       try {
         await osmd.load(src);
-        osmd.Zoom = zoom;              // set via property, not setOptions
+        osmd.Zoom = zoom;              // set via property
         await osmd.render();
         if (cancelled) return;
 
@@ -253,7 +253,8 @@ export default function ScoreOSMD({
         style={{
           position: "relative",
           overflow: "hidden",
-          height: viewportHeightPx ? `${viewportHeightPx}px` : "70vh",
+          height: viewportHeightPx ? `${viewportHeightPx}px` : "100%",
+          width: "100%",
           border: "1px solid #ddd",
           borderRadius: 8,
           background: "white",
