@@ -425,21 +425,53 @@ export default function ScoreOSMD({
         clearTimeout(zoomApplyTimerRef.current);
         zoomApplyTimerRef.current = null;
       }
-      zoomApplyTimerRef.current = window.setTimeout(async () => {
-        zoomApplyTimerRef.current = null;
-        const osmd = osmdRef.current;
-        if (!osmd) return;
+    zoomApplyTimerRef.current = window.setTimeout(async () => {
+      zoomApplyTimerRef.current = null;
+      const osmd = osmdRef.current;
+      if (!osmd) return;
 
-        // remember current top system by page start
-        const oldStarts = pageStartsRef.current;
-        const oldPage = pageIdxRef.current;
-        const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+      // remember current top system by page start
+      const oldStarts = pageStartsRef.current;
+      const oldPage = pageIdxRef.current;
+      const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
-        osmd.zoom = clamped;
-        await reflowAfterEngravingChange();
+      osmd.zoom = clamped;
+      osmd.render();
 
-        // place is preserved inside reflowAfterEngravingChange
-      }, ZOOM_DEBOUNCE_MS);
+      // wait at least 2 frames to let SVG update
+      await afterPaint();
+      await afterPaint();
+
+      const outer = wrapRef.current;
+      if (!outer) return;
+
+      let newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
+      if (!newBands.length) {
+        // retry once if SVG wasn't ready
+        await afterPaint();
+        newBands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
+      }
+      if (!newBands.length) {
+        console.warn("Zoom reflow: no systems measured, skipping update");
+        return;
+      }
+
+      bandsRef.current = newBands;
+      const availH = getAvailableHeight();
+      if (availH < 40) return;
+
+      const newStarts = computePageStartIndices(newBands, availH);
+      pageStartsRef.current = newStarts;
+
+      // Snap back to nearest previous system
+      let nearest = 0;
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < newStarts.length; i++) {
+        const d = Math.abs(newStarts[i] - oldTopSystem);
+        if (d < best) { best = d; nearest = i; }
+      }
+      applyPage(nearest);
+    }, ZOOM_DEBOUNCE_MS);
     },
     [reflowAfterEngravingChange]
   );
