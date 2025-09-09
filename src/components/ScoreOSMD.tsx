@@ -11,7 +11,7 @@ type Props = {
   height?: number;        // if not fillParent
   className?: string;
   style?: React.CSSProperties;
-  allowScroll?: boolean;  // if you ever want native scroll
+  allowScroll?: boolean;  // keep false (we page with wheel/keys)
 };
 
 /* Types */
@@ -112,6 +112,7 @@ export default function ScoreOSMD({
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const controlsRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
 
   // Layout model
@@ -121,7 +122,15 @@ export default function ScoreOSMD({
   const readyRef = useRef<boolean>(false);
 
   // HUD
-  const [hud, setHud] = useState({ page: 1, pages: 1 });
+  const [hud, setHud] = useState({ page: 1, pages: 1, zoomPct: 100 });
+
+  // Zoom
+  const [zoom, setZoom] = useState<number>(1.0);     // 1.00 = 100%
+  const zoomApplyTimerRef = useRef<number | null>(null);
+  const ZOOM_MIN = 0.6;
+  const ZOOM_MAX = 2.0;
+  const ZOOM_STEP = 0.01;
+  const ZOOM_DEBOUNCE_MS = 180;
 
   // Prevent WebGL warnings on some platforms
   function purgeWebGL(node: HTMLElement): void {
@@ -136,6 +145,15 @@ export default function ScoreOSMD({
       } catch {}
     }
   }
+
+  /** Available vertical space = wrapper height minus controls bar height */
+  const getAvailableHeight = useCallback((): number => {
+    const outer = wrapRef.current;
+    const controls = controlsRef.current;
+    if (!outer) return 0;
+    const ch = controls?.offsetHeight ?? 0;
+    return Math.max(0, outer.clientHeight - ch);
+  }, []);
 
   /** Apply a page index: translate SVG & mask bottom so no partial next line shows */
   const applyPage = useCallback(
@@ -164,12 +182,12 @@ export default function ScoreOSMD({
       svg.style.willChange = "transform";
 
       // Bottom mask: from top of next page's first system (minus tiny overlap)
+      const availH = getAvailableHeight();
       const maskTopPx = (() => {
-        const h = outer.clientHeight;
-        if (nextStartIndex < 0) return h;
+        if (nextStartIndex < 0) return availH;
         const nextTopRel = bands[nextStartIndex].top - startTop;
         const overlap = 4; // px
-        return Math.min(h - 1, Math.max(0, Math.ceil(nextTopRel - overlap)));
+        return Math.min(availH - 1, Math.max(0, Math.ceil(nextTopRel - overlap)));
       })();
 
       // Create/update mask
@@ -189,22 +207,24 @@ export default function ScoreOSMD({
         } as CSSStyleDeclaration);
         outer.appendChild(mask);
       }
+      // anchor the mask’s top based on usable height
       mask.style.top = `${maskTopPx}px`;
 
       // HUD
-      setHud({ page: clampedPage + 1, pages });
+      setHud({ page: clampedPage + 1, pages, zoomPct: Math.round(zoom * 100) });
     },
-    []
+    [getAvailableHeight, zoom]
   );
 
-  /** Recompute *only* pagination (height changed), keeping the same page index if possible */
+  /** Recompute pagination when only height changed (keep current page if possible) */
   const recomputePaginationHeightOnly = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
     const bands = bandsRef.current;
     if (!bands.length) return;
 
-    const starts = computePageStartIndices(bands, outer.clientHeight);
+    const availH = getAvailableHeight();
+    const starts = computePageStartIndices(bands, availH);
     const oldStarts = pageStartsRef.current;
     pageStartsRef.current = starts;
 
@@ -222,10 +242,10 @@ export default function ScoreOSMD({
       }
     }
     applyPage(nearest);
-  }, [applyPage]);
+  }, [applyPage, getAvailableHeight]);
 
-  /** Full reflow: width changed → re-render OSMD, re-measure bands, recompute pages, keep nearest */
-  const reflowOnWidthChange = useCallback(async () => {
+  /** Full reflow: width OR zoom changed → re-render OSMD, re-measure bands, recompute pages, keep nearest */
+  const reflowAfterEngravingChange = useCallback(async () => {
     const outer = wrapRef.current;
     const osmd = osmdRef.current;
     if (!outer || !osmd) return;
@@ -242,7 +262,8 @@ export default function ScoreOSMD({
     if (!newBands.length) return;
     bandsRef.current = newBands;
 
-    const newStarts = computePageStartIndices(newBands, outer.clientHeight);
+    const availH = getAvailableHeight();
+    const newStarts = computePageStartIndices(newBands, availH);
     pageStartsRef.current = newStarts;
 
     // Find page whose start system index is closest to the previous top system
@@ -256,11 +277,12 @@ export default function ScoreOSMD({
       }
     }
     applyPage(nearest);
-  }, [applyPage]);
+  }, [applyPage, getAvailableHeight]);
 
   /** Init OSMD and first layout */
   useEffect(() => {
     let resizeObs: ResizeObserver | null = null;
+    let controlsObs: ResizeObserver | null = null;
     let lastW = -1;
     let lastH = -1;
 
@@ -300,13 +322,14 @@ export default function ScoreOSMD({
       bandsRef.current = bands;
 
       // Pages & first page
-      pageStartsRef.current = computePageStartIndices(bands, outer.clientHeight);
+      pageStartsRef.current = computePageStartIndices(bands, getAvailableHeight());
       pageIdxRef.current = 0;
+      setHud((h) => ({ ...h, zoomPct: Math.round(zoom * 100) }));
       applyPage(0);
 
       readyRef.current = true;
 
-      // Observe wrapper size; only re-render on width changes.
+      // Observe wrapper size; only re-render on width changes; height triggers pagination only.
       resizeObs = new ResizeObserver(() => {
         if (!readyRef.current) return;
         const w = outer.clientWidth;
@@ -319,10 +342,8 @@ export default function ScoreOSMD({
         lastH = h;
 
         if (widthChanged) {
-          // Width affects OSMD layout: re-render + re-measure + re-page.
-          reflowOnWidthChange();
+          reflowAfterEngravingChange();
         } else if (heightChanged) {
-          // Height does NOT affect OSMD layout: only recompute pagination/mask.
           recomputePaginationHeightOnly();
         }
       });
@@ -330,19 +351,34 @@ export default function ScoreOSMD({
       // initialize lastW/H
       lastW = outer.clientWidth;
       lastH = outer.clientHeight;
+
+      // Observe controls bar height (so it never covers the score)
+      if (controlsRef.current) {
+        controlsObs = new ResizeObserver(() => {
+          if (!readyRef.current) return;
+          // controls height changed -> only pagination/mask needs update
+          recomputePaginationHeightOnly();
+        });
+        controlsObs.observe(controlsRef.current);
+      }
     })().catch(() => {});
 
     return () => {
       if (resizeObs && wrapRef.current) resizeObs.unobserve(wrapRef.current);
+      if (controlsObs && controlsRef.current) controlsObs.unobserve(controlsRef.current);
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
+      if (zoomApplyTimerRef.current) {
+        clearTimeout(zoomApplyTimerRef.current);
+        zoomApplyTimerRef.current = null;
+      }
     };
-  }, [applyPage, recomputePaginationHeightOnly, reflowOnWidthChange, src]);
+  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowAfterEngravingChange, src, zoom]);
 
-  /** Paging controls */
+  /** Wheel/keyboard paging */
   const goNext = useCallback(() => {
     const pages = pageStartsRef.current.length;
     if (!pages) return;
@@ -355,7 +391,6 @@ export default function ScoreOSMD({
     if (prev !== pageIdxRef.current) applyPage(prev);
   }, [applyPage]);
 
-  // Optional: wheel/keyboard paging
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!readyRef.current) return;
@@ -383,6 +418,34 @@ export default function ScoreOSMD({
     };
   }, [applyPage, goNext, goPrev]);
 
+  /** Zoom: debounce, set osmd.zoom, render, re-measure, keep nearest page */
+  const scheduleApplyZoom = useCallback(
+    (value: number) => {
+      setZoom(value);
+      setHud((h) => ({ ...h, zoomPct: Math.round(value * 100) }));
+      if (zoomApplyTimerRef.current) {
+        clearTimeout(zoomApplyTimerRef.current);
+        zoomApplyTimerRef.current = null;
+      }
+      zoomApplyTimerRef.current = window.setTimeout(async () => {
+        zoomApplyTimerRef.current = null;
+        const osmd = osmdRef.current;
+        if (!osmd) return;
+        // remember current top system by page start
+        const oldStarts = pageStartsRef.current;
+        const oldPage = pageIdxRef.current;
+        const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+
+        osmd.zoom = value;
+        await reflowAfterEngravingChange();
+
+        // Ensure we kept place (reflowAfterEngravingChange already maps by top system)
+        // No extra work needed here.
+      }, ZOOM_DEBOUNCE_MS);
+    },
+    [reflowAfterEngravingChange]
+  );
+
   /* ---------- Styles ---------- */
 
   const outerStyle: React.CSSProperties = fillParent
@@ -391,18 +454,39 @@ export default function ScoreOSMD({
 
   const hostStyle: React.CSSProperties = {
     position: "absolute",
-    inset: 0,
-    overflow: "hidden",   // no native scroll; we page by buttons/wheel/keys
+    top: 0,
+    left: 0,
+    right: 0,
+    // bottom is reserved by controls bar; we let the mask account for it, so keep host full:
+    bottom: 0,
+    overflow: "hidden",   // no native vertical scroll
     minWidth: 0,          // avoid horizontal scrollbar jiggle
   };
 
-  const btn: React.CSSProperties = {
-    padding: "6px 10px",
-    borderRadius: 8,
-    border: "1px solid #ccc",
-    background: "#fff",
-    cursor: "pointer",
-    fontWeight: 600,
+  const barStyle: React.CSSProperties = {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 44,                          // fixed bar height (observed by ResizeObserver)
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "8px 12px",
+    background: "linear-gradient(to top, rgba(255,255,255,0.96), rgba(255,255,255,0.9))",
+    borderTop: "1px solid #e5e7eb",
+    zIndex: 20,
+    userSelect: "none",
+  };
+
+  const labelStyle: React.CSSProperties = {
+    font: "12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    color: "#111",
+    whiteSpace: "nowrap",
+  };
+
+  const sliderStyle: React.CSSProperties = {
+    flex: 1,
   };
 
   // Live HUD from refs
@@ -413,28 +497,20 @@ export default function ScoreOSMD({
     <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
       <div ref={hostRef} style={hostStyle} />
 
-      {/* Controls */}
-      <div style={{ position: "absolute", right: 10, top: 10, display: "flex", gap: 8, zIndex: 10 }}>
-        <button type="button" style={btn} onClick={goPrev}>Prev</button>
-        <button type="button" style={btn} onClick={goNext}>Next</button>
-      </div>
-
-      {/* HUD */}
-      <div
-        style={{
-          position: "absolute",
-          right: 10,
-          bottom: 10,
-          padding: "6px 10px",
-          background: "rgba(0,0,0,0.55)",
-          color: "#fff",
-          borderRadius: 8,
-          font: "12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial",
-          zIndex: 10,
-          pointerEvents: "none",
-        }}
-      >
-        Page {page}/{pages}
+      {/* Bottom control bar (never covers score; we subtract its height in calculations) */}
+      <div ref={controlsRef} style={barStyle}>
+        <div style={labelStyle}>Page {page}/{pages}</div>
+        <div style={{ width: 10 }} />
+        <div style={labelStyle}>Zoom {hud.zoomPct}%</div>
+        <input
+          type="range"
+          min={ZOOM_MIN}
+          max={ZOOM_MAX}
+          step={ZOOM_STEP}
+          value={zoom}
+          onChange={(e) => scheduleApplyZoom(Number(e.currentTarget.value))}
+          style={sliderStyle}
+        />
       </div>
     </div>
   );
