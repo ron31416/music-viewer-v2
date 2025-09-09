@@ -1,10 +1,9 @@
 // src/components/ScoreOSMD.tsx
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* Props & types */
 type Props = {
   src: string;
   fillParent?: boolean;
@@ -17,11 +16,11 @@ type Props = {
 type Band = { top: number; bottom: number; height: number };
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
-/* Small helpers */
+/* Helpers */
 const afterPaint = () =>
   new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
-const isPromise = <T,>(x: unknown): x is Promise<T> =>
-  typeof x === "object" && x !== null && "then" in (x as any);
+const isPromise = (x: unknown): x is Promise<unknown> =>
+  typeof x === "object" && x !== null && typeof (x as { then?: unknown }).then === "function";
 
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg");
@@ -50,7 +49,7 @@ function purgeWebGL(node: HTMLElement): void {
   }
 }
 
-/* Measure OSMD systems (SVG <g> clusters) in px relative to wrapper */
+/* Measure systems */
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
     svgRoot.querySelectorAll<SVGGElement>(
@@ -67,14 +66,14 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
     for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
       const r = g.getBoundingClientRect();
       if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-      if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
+      if (r.height < 8 || r.width < 40) continue;
       boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
     }
   }
 
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px between system groups
+  const GAP = 18;
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -104,15 +103,14 @@ export default function ScoreOSMD({
   // Layout model
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
-  const startIdxRef = useRef<number>(0); // authoritative first-visible system index
+  const startIdxRef = useRef<number>(0);
   const readyRef = useRef<boolean>(false);
 
   // UI
   const maskRef = useRef<HTMLDivElement | null>(null);
-  const [hud, setHud] = useState({ page: 1, maxPage: 1, perPage: 1, total: 0 });
 
   // Tunables
-  const MASK_OVERLAP = 4; // px: hide slightly above next system top
+  const MASK_OVERLAP = 4;
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
@@ -136,16 +134,7 @@ export default function ScoreOSMD({
     }
   }, []);
 
-  // HUD
-  const updateHUD = useCallback(() => {
-    const total = bandsRef.current.length;
-    const perPage = Math.max(1, perPageRef.current);
-    const page = Math.floor(startIdxRef.current / perPage) + 1;
-    const maxPage = Math.max(1, Math.ceil(total / perPage));
-    setHud({ page: Math.min(page, maxPage), maxPage, perPage, total });
-  }, []);
-
-  // Align by startIdx (not by page)
+  // Align by startIdx
   const applyFromStartIdx = useCallback((startIdx: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -165,12 +154,10 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(clampedStart + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    // snap to top; ceil avoids tiny top gaps
     const ySnap = Math.ceil(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // bottom mask from NEXT system top (with tiny overlap)
     let maskTop = outer.clientHeight;
     if (nextIdx < total) {
       const nextTopRel = bands[nextIdx].top - startTop;
@@ -180,17 +167,15 @@ export default function ScoreOSMD({
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
     }
+  }, []);
 
-    updateHUD();
-  }, [MASK_OVERLAP, updateHUD]);
-
-  // Recompute bands + perPage; keep same startIdx across reflow
+  // Measure + keep idx
   const recomputeLayoutAndKeepIdx = useCallback(() => {
     const outer = wrapRef.current;
     if (!outer) return;
 
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
-    if (!bands.length) return; // don’t clobber startIdx while OSMD is between renders
+    if (!bands.length) return;
     bandsRef.current = bands;
 
     const limit = outer.clientHeight;
@@ -213,27 +198,23 @@ export default function ScoreOSMD({
     if (!outer || !osmd) return;
 
     const myToken = ++reflowTokenRef.current;
-    if (renderInProgressRef.current) {
-      // a render is already queued/running; the token will cause only the last to apply
-    }
 
     requestAnimationFrame(async () => {
       if (myToken !== reflowTokenRef.current) return;
+      if (renderInProgressRef.current) return; // simple coalescing
       renderInProgressRef.current = true;
 
-      // trigger OSMD layout for the new size
       osmd.render();
       await afterPaint();
       await waitForStableLayout(outer);
       if (myToken !== reflowTokenRef.current) { renderInProgressRef.current = false; return; }
 
-      // measure + realign by the same startIdx
       recomputeLayoutAndKeepIdx();
       renderInProgressRef.current = false;
     });
   }, [recomputeLayoutAndKeepIdx, waitForStableLayout]);
 
-  // Paging (uses startIdx directly)
+  // Paging
   const nextPage = useCallback((deltaPages: number) => {
     if (!readyRef.current) return;
     const perPage = Math.max(1, perPageRef.current);
@@ -298,7 +279,7 @@ export default function ScoreOSMD({
 
       const osmd = new OpenSheetMusicDisplay(host, {
         backend: "svg" as const,
-        autoResize: false, // ← we own resize now
+        autoResize: false, // we own resize
         drawTitle: true,
         drawSubtitle: true,
         drawComposer: true,
@@ -313,7 +294,6 @@ export default function ScoreOSMD({
 
       purgeWebGL(wrapper);
 
-      // one-time bottom mask
       if (!maskRef.current) {
         const mask = document.createElement("div");
         mask.style.position = "absolute";
@@ -329,8 +309,8 @@ export default function ScoreOSMD({
         maskRef.current = mask;
       }
 
-      startIdxRef.current = 0; // first system
-      // initial measure + align
+      startIdxRef.current = 0;
+
       const bands = withUntransformedSvg(wrapper, (svg) => measureSystemsPx(wrapper, svg)) ?? [];
       bandsRef.current = bands;
       const limit = wrapper.clientHeight;
@@ -344,16 +324,17 @@ export default function ScoreOSMD({
 
       readyRef.current = true;
 
-      // Observe wrapper; run our single resize pass
+      const observedWrapper = wrapper; // capture for cleanup
       resizeObs = new ResizeObserver(() => {
         if (!readyRef.current) return;
         scheduleResizePass();
       });
-      resizeObs.observe(wrapper);
+      resizeObs.observe(observedWrapper);
     })().catch(() => {});
 
     return () => {
-      if (resizeObs && wrapRef.current) resizeObs.unobserve(wrapRef.current);
+      const wrapperAtUnmount = wrapRef.current; // capture current safely
+      if (resizeObs && wrapperAtUnmount) resizeObs.unobserve(wrapperAtUnmount);
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -383,7 +364,7 @@ export default function ScoreOSMD({
     fontWeight: 600,
   };
 
-  // HUD (derived live)
+  // Live HUD (derived)
   const total = bandsRef.current.length;
   const perPage = Math.max(1, perPageRef.current);
   const curPage = Math.min(Math.floor(startIdxRef.current / perPage) + 1, Math.max(1, Math.ceil(total / perPage)));
