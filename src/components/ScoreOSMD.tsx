@@ -12,11 +12,11 @@ import { OpenSheetMusicDisplay, IOSMDOptions } from "opensheetmusicdisplay";
 
 type ScoreOSMDProps = {
   src: string;
-  /** Show bottom status bar (Page X / N). No prev/next buttons; no zoom control. */
+  /** Bottom status bar (Page X / N). No prev/next, no zoom UI. */
   showControls?: boolean;
   className?: string;
   style?: CSSProperties;
-  /** Optional fixed viewport height (px). If omitted, defaults to a stable 70vh. */
+  /** Optional fixed viewport height (px). If omitted, uses 100% of parent. */
   viewportHeightPx?: number;
 };
 
@@ -37,7 +37,7 @@ export default function ScoreOSMD({
   const [pages, setPages] = useState<Page[]>([]);
   const [pageIndex, setPageIndex] = useState(0);
 
-  /** Compute pages from system heights, using a stable viewport height. */
+  /** Compute pages from system heights, reserving space for footer bar so no partial system shows. */
   const computePages = useCallback((): Page[] => {
     const svgRoot = containerRef.current?.querySelector("svg");
     if (!svgRoot) return [];
@@ -45,10 +45,16 @@ export default function ScoreOSMD({
     const systems = Array.from(svgRoot.querySelectorAll<SVGGElement>("g.system"));
     if (!systems.length) return [];
 
-    // Use explicit override, else measured clientHeight if non-zero, else a stable fallback (70vh).
+    // Reserve pixels for footer if visible
+    const footerPx = showControls ? 36 : 0;
+
+    // Determine available height:
+    // 1) explicit override, else 2) measured clientHeight, else 3) window height fallback.
     const measured = viewportRef.current?.clientHeight ?? 0;
-    const fallback = Math.max(1, Math.round((window?.innerHeight ?? 900) * 0.7));
-    const vh = viewportHeightPx ?? (measured > 0 ? measured : fallback);
+    const fallback = Math.max(1, (typeof window !== "undefined" ? window.innerHeight : 900) - footerPx);
+    const rawVh = viewportHeightPx ?? (measured > 0 ? measured : fallback);
+
+    const vh = Math.max(1, rawVh - footerPx); // subtract footer space
 
     const heights = systems.map((g) => g.getBBox().height);
 
@@ -59,7 +65,7 @@ export default function ScoreOSMD({
     for (let i = 0; i < heights.length; i++) {
       const h = heights[i];
 
-      // If the next system would overflow the page, end before it.
+      // If adding this system would overflow, close the page before it.
       if (acc > 0 && acc + h > vh) {
         next.push({ start, end: i - 1 });
         start = i;
@@ -67,7 +73,7 @@ export default function ScoreOSMD({
       }
       acc += h;
 
-      // If a single system is taller than the viewport, make it its own page.
+      // If a single system is taller than the viewport, it becomes a solo page.
       if (h > vh) {
         if (acc !== h) next.push({ start, end: i - 1 });
         next.push({ start: i, end: i });
@@ -78,9 +84,9 @@ export default function ScoreOSMD({
 
     if (start < heights.length) next.push({ start, end: heights.length - 1 });
     return next;
-  }, [viewportHeightPx]);
+  }, [viewportHeightPx, showControls]);
 
-  /** Show only the systems in the current page (mask partial lines by hiding other systems). */
+  /** Show only the systems in the current page (mask others). */
   const applyPageVisibility = useCallback((page: Page | null) => {
     const svgRoot = containerRef.current?.querySelector("svg");
     if (!svgRoot) return;
@@ -97,7 +103,7 @@ export default function ScoreOSMD({
     });
   }, []);
 
-  /** Initialize OSMD (no zoom changes here). */
+  /** Initialize OSMD; compute pages after render + next frame (ensures SVG is measurable). */
   useEffect(() => {
     let cancelled = false;
 
@@ -106,7 +112,7 @@ export default function ScoreOSMD({
 
       const options: Partial<IOSMDOptions> = {
         backend: "svg",
-        autoResize: false, // we control when to re-render for stability
+        autoResize: false, // we control renders for stability
         drawTitle: true,
       };
 
@@ -115,11 +121,11 @@ export default function ScoreOSMD({
 
       try {
         await osmd.load(src);
-        // Keep default Zoom (1.0). Zoom UI removed for now to avoid blank-page issues.
+        // Keep default Zoom (1.0). Zoom UI intentionally removed in this build.
         osmd.render();
         if (cancelled) return;
 
-        // Defer measurement slightly to ensure SVG is fully laid out
+        // Defer to next frame so clientHeight and SVG BBoxes are ready
         requestAnimationFrame(() => {
           const nextPages = computePages();
           setPages(nextPages);
@@ -144,7 +150,7 @@ export default function ScoreOSMD({
     applyPageVisibility(pages[clamped] ?? null);
   }, [pages, pageIndex, applyPageVisibility]);
 
-  /** Re-paginate on window resize (render synchronously; measure on next frame). */
+  /** Re-paginate on window resize (render synchronously, measure on next frame). */
   useEffect(() => {
     const onResize = () => {
       if (!osmdRef.current) return;
@@ -162,7 +168,7 @@ export default function ScoreOSMD({
     return () => window.removeEventListener("resize", onResize);
   }, [computePages]);
 
-  /** Optional: keyboard navigation for paging (no visible buttons). */
+  /** Optional keyboard paging (no visible buttons). */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!pages.length) return;
@@ -196,8 +202,8 @@ export default function ScoreOSMD({
         style={{
           position: "relative",
           overflow: "hidden",
-          // IMPORTANT: default to 70vh unless explicitly overridden to avoid early 0px measurement.
-          height: viewportHeightPx ? `${viewportHeightPx}px` : "70vh",
+          // Fill parent by default for parity with your app layout
+          height: viewportHeightPx ? `${viewportHeightPx}px` : "100%",
           width: "100%",
           background: "white",
         }}
@@ -220,7 +226,7 @@ export default function ScoreOSMD({
           </div>
         )}
 
-        {/* Bottom status bar (minimal; no zoom, no prev/next buttons) */}
+        {/* Bottom status bar (kept minimal; no zoom, no prev/next) */}
         {showControls && (
           <div
             style={{
@@ -233,14 +239,12 @@ export default function ScoreOSMD({
               alignItems: "center",
               gap: 12,
               padding: "6px 10px",
-              background: "rgba(255,255,255,0.85)",
+              background: "rgba(255,255,255,0.9)",
               borderTop: "1px solid #ddd",
               fontSize: 13,
             }}
           >
-            <span>
-              Page {currentPageSafe}/{totalPages}
-            </span>
+            <span>Page {currentPageSafe}/{totalPages}</span>
           </div>
         )}
       </div>
