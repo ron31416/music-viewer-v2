@@ -88,6 +88,13 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   return bands;
 }
 
+/* Parse current translateY(px) from svg.style.transform */
+function readTranslateY(svg: SVGSVGElement | null): number {
+  if (!svg) return 0;
+  const m = /translateY\(\s*(-?\d+(?:\.\d+)?)px\)/.exec(svg.style.transform || "");
+  return m ? Number(m[1]) : 0;
+}
+
 export default function ScoreOSMD({
   src,
   fillParent = false,
@@ -103,25 +110,28 @@ export default function ScoreOSMD({
   // Layout model
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
-  const startIdxRef = useRef<number>(0);
+  const startIdxRef = useRef<number>(0);          // authoritative first-visible system index
   const readyRef = useRef<boolean>(false);
 
   // UI
   const maskRef = useRef<HTMLDivElement | null>(null);
 
   // Tunables
-  const MASK_OVERLAP = 4;
+  const MASK_OVERLAP = 4;       // px
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
-  // Stabilizer
+  // Stabilizers
   const reflowTokenRef = useRef<number>(0);
   const renderInProgressRef = useRef<boolean>(false);
+  const lastYSnapRef = useRef<number>(0);         // last applied translateY(px)
+  const STICKY_EPS = 12;                          // px hysteresis to ignore tiny reflow shifts
+
   const waitForStableLayout = useCallback(async (outer: HTMLDivElement) => {
     const svg = getSvg(outer);
     if (!svg) return;
     const NEED_STABLE = 4;
-    const TIMEOUT_MS = 400;
+    const TIMEOUT_MS = 450;
     let stable = 0;
     let prev = { w: -1, h: -1, cw: -1, ch: -1 };
     const t0 = performance.now();
@@ -134,7 +144,7 @@ export default function ScoreOSMD({
     }
   }, []);
 
-  // Align by startIdx
+  // Align by startIdx, with sticky top & bottom mask
   const applyFromStartIdx = useCallback((startIdx: number) => {
     const outer = wrapRef.current;
     if (!outer) return;
@@ -154,20 +164,28 @@ export default function ScoreOSMD({
     const lastIdx = Math.min(clampedStart + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    const ySnap = Math.ceil(startTop);
-    svg.style.transform = `translateY(${-ySnap}px)`;
-    svg.style.willChange = "transform";
+    // sticky top alignment: ignore tiny reflow nudges
+    const desiredYSnap = Math.ceil(startTop);
+    const useYSnap =
+      Math.abs(desiredYSnap - lastYSnapRef.current) <= STICKY_EPS
+        ? lastYSnapRef.current
+        : desiredYSnap;
 
+    svg.style.transform = `translateY(${-useYSnap}px)`;
+    svg.style.willChange = "transform";
+    lastYSnapRef.current = useYSnap;
+
+    // bottom mask from NEXT system top (with overlap)
     let maskTop = outer.clientHeight;
     if (nextIdx < total) {
-      const nextTopRel = bands[nextIdx].top - startTop;
+      const nextTopRel = bands[nextIdx].top - startTop - (useYSnap - desiredYSnap);
       maskTop = Math.min(outer.clientHeight - 1, Math.max(0, Math.ceil(nextTopRel - MASK_OVERLAP)));
     }
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
     }
-  }, []);
+  }, [MASK_OVERLAP, STICKY_EPS]);
 
   // Measure + keep idx
   const recomputeLayoutAndKeepIdx = useCallback(() => {
@@ -191,17 +209,31 @@ export default function ScoreOSMD({
     applyFromStartIdx(startIdxRef.current);
   }, [applyFromStartIdx]);
 
-  // Our single resize pipeline (we own renders)
+  // Our single resize pipeline (we own renders) with observed start index
   const scheduleResizePass = useCallback(() => {
     const outer = wrapRef.current;
     const osmd = osmdRef.current;
     if (!outer || !osmd) return;
 
+    // Observe which system is at top now (before render), using current translateY
+    let observedStartIdx = startIdxRef.current;
+    const svgBefore = getSvg(outer);
+    if (svgBefore && bandsRef.current.length) {
+      const tY = -readTranslateY(svgBefore); // current visible top in svg coords
+      // pick the first band whose top is >= current top-2px (tolerance)
+      const tol = 2;
+      let idx = 0;
+      for (let i = 0; i < bandsRef.current.length; i++) {
+        if (bandsRef.current[i].top >= tY - tol) { idx = i; break; }
+      }
+      observedStartIdx = idx;
+    }
+
     const myToken = ++reflowTokenRef.current;
 
     requestAnimationFrame(async () => {
       if (myToken !== reflowTokenRef.current) return;
-      if (renderInProgressRef.current) return; // simple coalescing
+      if (renderInProgressRef.current) return;
       renderInProgressRef.current = true;
 
       osmd.render();
@@ -209,6 +241,8 @@ export default function ScoreOSMD({
       await waitForStableLayout(outer);
       if (myToken !== reflowTokenRef.current) { renderInProgressRef.current = false; return; }
 
+      // restore to the *observed* start index across this reflow
+      startIdxRef.current = observedStartIdx;
       recomputeLayoutAndKeepIdx();
       renderInProgressRef.current = false;
     });
@@ -309,8 +343,7 @@ export default function ScoreOSMD({
         maskRef.current = mask;
       }
 
-      startIdxRef.current = 0;
-
+      // initial measure
       const bands = withUntransformedSvg(wrapper, (svg) => measureSystemsPx(wrapper, svg)) ?? [];
       bandsRef.current = bands;
       const limit = wrapper.clientHeight;
@@ -320,11 +353,14 @@ export default function ScoreOSMD({
         else break;
       }
       perPageRef.current = Math.max(1, n);
+
+      startIdxRef.current = 0;
+      lastYSnapRef.current = 0; // reset sticky baseline
       applyFromStartIdx(0);
 
       readyRef.current = true;
 
-      const observedWrapper = wrapper; // capture for cleanup
+      const observedWrapper = wrapper;
       resizeObs = new ResizeObserver(() => {
         if (!readyRef.current) return;
         scheduleResizePass();
@@ -333,7 +369,7 @@ export default function ScoreOSMD({
     })().catch(() => {});
 
     return () => {
-      const wrapperAtUnmount = wrapRef.current; // capture current safely
+      const wrapperAtUnmount = wrapRef.current;
       if (resizeObs && wrapperAtUnmount) resizeObs.unobserve(wrapperAtUnmount);
       if (osmdRef.current) {
         osmdRef.current.clear?.();
@@ -364,7 +400,7 @@ export default function ScoreOSMD({
     fontWeight: 600,
   };
 
-  // Live HUD (derived)
+  // Live HUD
   const total = bandsRef.current.length;
   const perPage = Math.max(1, perPageRef.current);
   const curPage = Math.min(Math.floor(startIdxRef.current / perPage) + 1, Math.max(1, Math.ceil(total / perPage)));
