@@ -21,6 +21,7 @@ type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?:
 /* ---------- Constants ---------- */
 const CONTROLS_H = 44;           // fixed bottom bar height (px)
 const OVERLAP_PX = 4;            // bottom mask overlap
+const GAP_PX = 18;               // cluster gap for grouping <g> into systems
 const ZOOM_MIN = 0.6;
 const ZOOM_MAX = 2.0;
 const ZOOM_STEP = 0.01;
@@ -28,7 +29,7 @@ const ZOOM_DEBOUNCE_MS = 180;
 
 /* ---------- Helpers ---------- */
 
-/** wait two paints */
+/** wait two paints (type-safe for RAF) */
 const afterPaint = () =>
   new Promise<void>((resolve) => {
     requestAnimationFrame(() => {
@@ -43,58 +44,50 @@ function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg");
 }
 
-/** find OSMD systems (lines) and measure them relative to wrapper */
-function measureSystemsPx(outer: HTMLDivElement): Band[] {
+/** Measure “bands” (systems) by clustering visible <g> blocks — this was your stable method */
+function measureSystemsPxByClusters(outer: HTMLDivElement): Band[] {
   const svg = getSvg(outer);
   if (!svg) return [];
 
   const hostTop = outer.getBoundingClientRect().top;
+  type Box = { top: number; bottom: number; height: number; width: number };
+  const boxes: Box[] = [];
 
-  // Prefer true system groups
-  const sysGroups = Array.from(
+  // Look under page roots if present, or the whole svg
+  const pageRoots = Array.from(
     svg.querySelectorAll<SVGGElement>(
-      'g[id*="system" i], g[class*="system" i], g[id^="System"], g[id^="system"]'
+      'g[id^="osmdCanvasPage"], g[id^="Page"], g[class*="Page"], g[class*="page"]'
     )
   );
+  const roots: Array<SVGGElement | SVGSVGElement> = pageRoots.length ? pageRoots : [svg];
 
-  const targets: Element[] =
-    sysGroups.length > 0
-      ? sysGroups
-      : Array.from(svg.querySelectorAll<SVGGElement>('g[id*="Page" i], g[class*="page" i]'));
+  for (const root of roots) {
+    for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
+      const r = g.getBoundingClientRect();
+      if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
+      if (r.height < 8 || r.width < 40) continue; // ignore tiny artifacts
+      boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
+    }
+  }
+
+  boxes.sort((a, b) => a.top - b.top);
 
   const bands: Band[] = [];
-  for (const el of targets) {
-    const r = el.getBoundingClientRect();
-    if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-    if (r.height < 12 || r.width < 80) continue; // ignore tiny artifacts
-    const top = r.top - hostTop;
-    const bottom = r.bottom - hostTop;
-    bands.push({ top, bottom, height: bottom - top });
-  }
-
-  // If we selected page blocks, merge into lines by gaps
-  if (!sysGroups.length && bands.length) {
-    bands.sort((a, b) => a.top - b.top);
-    const merged: Band[] = [];
-    const GAP_PX = 18;
-    for (const b of bands) {
-      const last = merged[merged.length - 1];
-      if (!last || b.top - last.bottom > GAP_PX) merged.push({ ...b });
-      else {
-        last.bottom = Math.max(last.bottom, b.bottom);
-        last.top = Math.min(last.top, b.top);
-        last.height = last.bottom - last.top;
-      }
+  for (const b of boxes) {
+    const last = bands[bands.length - 1];
+    if (!last || b.top - last.bottom > GAP_PX) {
+      bands.push({ top: b.top, bottom: b.bottom, height: b.height });
+    } else {
+      last.top = Math.min(last.top, b.top);
+      last.bottom = Math.max(last.bottom, b.bottom);
+      last.height = last.bottom - last.top;
     }
-    return merged;
   }
-
-  bands.sort((a, b) => a.top - b.top);
   return bands;
 }
 
-/** page starts so each page shows only full systems */
-function computePageStarts(bands: Band[], viewportH: number): number[] {
+/** Compute page start *indices* so each page shows only full systems */
+function computePageStartIndices(bands: Band[], viewportH: number): number[] {
   if (!bands.length || viewportH <= 0) return [0];
   const starts: number[] = [];
   let i = 0;
@@ -121,24 +114,28 @@ export default function ScoreOSMD({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
 
-  // Layout state (in refs to avoid re-renders)
+  // Layout model (refs)
   const bandsRef = useRef<Band[]>([]);
-  const pageStartsRef = useRef<number[]>([0]);
-  const pageIdxRef = useRef<number>(0);
+  const pageStartsRef = useRef<number[]>([0]); // indices into bands
+  const pageIdxRef = useRef<number>(0);        // current page index
 
-  // UI state
-  const [hud, setHud] = useState({ page: 1, pages: 1, zoomPct: 100 });
-  const [zoom, setZoom] = useState<number>(1.0);
-
-  // guards/timers/observers
-  const zoomTimerRef = useRef<number | null>(null);
+  // Guards
+  const readyRef = useRef<boolean>(false);
   const isZoomingRef = useRef<boolean>(false);
   const resizeObsRef = useRef<ResizeObserver | null>(null);
 
-  /** available height = wrapper minus controls bar */
-  const getAvailH = useCallback((): number => {
+  // HUD
+  const [hud, setHud] = useState({ page: 1, pages: 1, zoomPct: 100 });
+
+  // Zoom
+  const [zoom, setZoom] = useState<number>(1.0);     // 1.00 = 100%
+  const zoomApplyTimerRef = useRef<number | null>(null);
+
+  /** Available vertical space = wrapper height minus fixed controls bar height */
+  const getAvailableHeight = useCallback((): number => {
     const outer = wrapRef.current;
-    return outer ? Math.max(0, outer.clientHeight - CONTROLS_H) : 0;
+    if (!outer) return 0;
+    return Math.max(0, outer.clientHeight - CONTROLS_H);
   }, []);
 
   const getMaskEl = useCallback(
@@ -170,35 +167,39 @@ export default function ScoreOSMD({
     return mask;
   }, [getMaskEl]);
 
-  /** translate SVG & set bottom mask so no partial next line shows */
+  /** Apply a page index: translate SVG & mask bottom so no partial next line shows */
   const applyPage = useCallback(
-    (idx: number) => {
+    (pageIdx: number) => {
       const outer = wrapRef.current;
       if (!outer) return;
       const svg = getSvg(outer);
+      if (!svg) return;
+
       const bands = bandsRef.current;
       const starts = pageStartsRef.current;
-      if (!svg || !bands.length || !starts.length) return;
+      if (!bands.length || !starts.length) return;
 
       const pages = starts.length;
-      const page = Math.max(0, Math.min(idx, pages - 1));
-      pageIdxRef.current = page;
+      const clampedPage = Math.max(0, Math.min(pageIdx, pages - 1));
+      pageIdxRef.current = clampedPage;
 
-      const startIndex = starts[page];
+      const startIndex = starts[clampedPage];
       const startTop = bands[startIndex].top;
+
+      const nextStartIndex = clampedPage + 1 < starts.length ? starts[clampedPage + 1] : -1;
+
+      // Snap first visible system to top
       const ySnap = Math.ceil(startTop);
       svg.style.transform = `translateY(${-ySnap}px)`;
       svg.style.willChange = "transform";
 
-      const nextStartIndex = page + 1 < pages ? starts[page + 1] : -1;
-      const availH = getAvailH();
-      const maskTopPx =
-        nextStartIndex < 0
-          ? availH
-          : Math.min(
-              availH - 1,
-              Math.max(0, Math.ceil(bands[nextStartIndex].top - startTop - OVERLAP_PX))
-            );
+      // Bottom mask: from top of next page's first system (minus tiny overlap)
+      const availH = getAvailableHeight();
+      const maskTopPx = (() => {
+        if (nextStartIndex < 0) return availH;
+        const nextTopRel = bands[nextStartIndex].top - startTop;
+        return Math.min(availH - 1, Math.max(0, Math.ceil(nextTopRel - OVERLAP_PX)));
+      })();
 
       const mask = ensureMask();
       if (mask) {
@@ -206,105 +207,105 @@ export default function ScoreOSMD({
         mask.style.top = `${maskTopPx}px`;
       }
 
-      setHud({ page: page + 1, pages, zoomPct: Math.round(zoom * 100) });
+      // HUD
+      setHud({ page: clampedPage + 1, pages, zoomPct: Math.round(zoom * 100) });
     },
-    [ensureMask, getAvailH, zoom]
+    [ensureMask, getAvailableHeight, zoom]
   );
 
-  /** only height changed → recompute pagination; keep nearest page */
-  const repaginateHeightOnly = useCallback(() => {
+  /** Recompute pagination when only height changed (keep current page if possible) */
+  const recomputePaginationHeightOnly = useCallback(() => {
     if (isZoomingRef.current) return;
     const bands = bandsRef.current;
     if (!bands.length) return;
-    const availH = getAvailH();
+
+    const availH = getAvailableHeight();
     if (availH < 40) return;
 
-    const newStarts = computePageStarts(bands, availH);
+    const starts = computePageStartIndices(bands, availH);
     const oldStarts = pageStartsRef.current;
-    const oldPage = pageIdxRef.current;
-    const oldStart = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+    pageStartsRef.current = starts;
 
-    pageStartsRef.current = newStarts;
+    // keep same page by nearest start index
+    const oldPage = pageIdxRef.current;
+    const oldStartIdx = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
     let nearest = 0;
     let best = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < newStarts.length; i++) {
-      const d = Math.abs(newStarts[i] - oldStart);
-      if (d < best) {
-        best = d;
-        nearest = i;
-      }
+    for (let i = 0; i < starts.length; i++) {
+      const d = Math.abs(starts[i] - oldStartIdx);
+      if (d < best) { best = d; nearest = i; }
     }
     applyPage(nearest);
-  }, [applyPage, getAvailH]);
+  }, [applyPage, getAvailableHeight]);
 
-  /** width changed → full OSMD render, re-measure, keep place */
+  /** Full reflow: width change → re-render OSMD, re-measure bands, recompute pages, keep nearest */
   const reflowOnWidthChange = useCallback(async () => {
     if (isZoomingRef.current) return;
     const outer = wrapRef.current;
     const osmd = osmdRef.current;
     if (!outer || !osmd) return;
 
+    // Remember which system index was at the top (by current page start index)
     const oldStarts = pageStartsRef.current;
     const oldPage = pageIdxRef.current;
-    const oldTop = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+    const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
     osmd.render();
     await afterPaint();
     await afterPaint();
 
-    // Wait for systems to be measurable
+    // Robustly wait until bands are measurable
     let tries = 0;
     let bands: Band[] = [];
     do {
-      bands = measureSystemsPx(outer);
+      bands = measureSystemsPxByClusters(outer);
       if (bands.length) break;
       await afterPaint();
       tries++;
-    } while (tries < 6);
+    } while (tries < 8);
 
     if (!bands.length) return;
-
     bandsRef.current = bands;
 
-    const availH = getAvailH();
+    const availH = getAvailableHeight();
     if (availH < 40) return;
 
-    const starts = computePageStarts(bands, availH);
-    pageStartsRef.current = starts;
+    const newStarts = computePageStartIndices(bands, availH);
+    pageStartsRef.current = newStarts;
 
+    // Find page whose start system index is closest to the previous top system
     let nearest = 0;
     let best = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < starts.length; i++) {
-      const d = Math.abs(starts[i] - oldTop);
+    for (let i = 0; i < newStarts.length; i++) {
+      const d = Math.abs(newStarts[i] - oldTopSystem);
       if (d < best) { best = d; nearest = i; }
     }
     applyPage(nearest);
-  }, [applyPage, getAvailH]);
+  }, [applyPage, getAvailableHeight]);
 
-  /* ---------- Init OSMD once per src ---------- */
+  /** Init OSMD and first layout */
   useEffect(() => {
     let lastW = -1;
     let lastH = -1;
 
     (async () => {
-      const outer = wrapRef.current;
       const host = hostRef.current;
-      if (!outer || !host) return;
+      const outer = wrapRef.current;
+      if (!host || !outer) return;
 
       const { OpenSheetMusicDisplay } =
         (await import("opensheetmusicdisplay")) as typeof import("opensheetmusicdisplay");
 
-      // fresh instance
+      // Fresh OSMD
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
-
       const osmd = new OpenSheetMusicDisplay(host, {
-        backend: "svg",
-        autoResize: false,
+        backend: "svg" as const,
+        autoResize: false, // we control when to render
         drawTitle: true,
         drawSubtitle: true,
         drawComposer: true,
@@ -317,37 +318,51 @@ export default function ScoreOSMD({
       osmd.render();
       await afterPaint();
 
-      // Initial measure (wait until systems exist)
+      // Initial measure (robust)
       let tries = 0;
       let bands: Band[] = [];
       do {
-        bands = measureSystemsPx(outer);
+        bands = measureSystemsPxByClusters(outer);
         if (bands.length) break;
         await afterPaint();
         tries++;
-      } while (tries < 6);
+      } while (tries < 8);
 
-      if (!bands.length) return; // nothing to show
+      if (!bands.length) return;
 
       bandsRef.current = bands;
-      pageStartsRef.current = computePageStarts(bands, getAvailH());
+
+      // Pages & first page
+      pageStartsRef.current = computePageStartIndices(bands, getAvailableHeight());
       pageIdxRef.current = 0;
-      setHud({ page: 1, pages: pageStartsRef.current.length, zoomPct: Math.round(zoom * 100) });
+      setHud((h) => ({ ...h, zoomPct: Math.round(zoom * 100) }));
       applyPage(0);
 
-      // observe size
+      readyRef.current = true;
+
+      // Observe wrapper size; only re-render on width changes; height triggers pagination only.
       const obs = new ResizeObserver(() => {
-        if (isZoomingRef.current) return;
-        const w = outer.clientWidth;
-        const h = outer.clientHeight;
+        if (!readyRef.current || isZoomingRef.current) return;
+        const outerNow = wrapRef.current;
+        if (!outerNow) return;
+        const w = outerNow.clientWidth;
+        const h = outerNow.clientHeight;
+
         const widthChanged = lastW !== -1 && Math.abs(w - lastW) >= 1;
         const heightChanged = lastH !== -1 && Math.abs(h - lastH) >= 1;
-        lastW = w; lastH = h;
-        if (widthChanged) reflowOnWidthChange();
-        else if (heightChanged) repaginateHeightOnly();
+
+        lastW = w;
+        lastH = h;
+
+        if (widthChanged) {
+          reflowOnWidthChange();
+        } else if (heightChanged) {
+          recomputePaginationHeightOnly();
+        }
       });
       obs.observe(outer);
       resizeObsRef.current = obs;
+      // initialize lastW/H
       lastW = outer.clientWidth;
       lastH = outer.clientHeight;
     })().catch(() => {});
@@ -360,16 +375,17 @@ export default function ScoreOSMD({
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
-      if (zoomTimerRef.current) {
-        clearTimeout(zoomTimerRef.current);
-        zoomTimerRef.current = null;
+      if (zoomApplyTimerRef.current) {
+        clearTimeout(zoomApplyTimerRef.current);
+        zoomApplyTimerRef.current = null;
       }
     };
-  }, [applyPage, getAvailH, reflowOnWidthChange, repaginateHeightOnly, src]); // <-- NO zoom here
+  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowOnWidthChange, src]); // NO zoom here
 
-  /* ---------- Paging controls (wheel/keys) ---------- */
+  /** Wheel/keyboard paging */
   const goNext = useCallback(() => {
     const pages = pageStartsRef.current.length;
+    if (!pages) return;
     const next = Math.min(pageIdxRef.current + 1, pages - 1);
     if (next !== pageIdxRef.current) applyPage(next);
   }, [applyPage]);
@@ -381,11 +397,14 @@ export default function ScoreOSMD({
 
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
+      if (!readyRef.current) return;
       if (Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
       e.preventDefault();
-      if (e.deltaY > 0) goNext(); else goPrev();
+      if (e.deltaY > 0) goNext();
+      else goPrev();
     };
     const onKey = (e: KeyboardEvent) => {
+      if (!readyRef.current) return;
       if (["PageDown", "ArrowDown", " "].includes(e.key)) { e.preventDefault(); goNext(); }
       else if (["PageUp", "ArrowUp"].includes(e.key)) { e.preventDefault(); goPrev(); }
       else if (e.key === "Home") { e.preventDefault(); applyPage(0); }
@@ -403,19 +422,19 @@ export default function ScoreOSMD({
     };
   }, [applyPage, goNext, goPrev]);
 
-  /* ---------- Zoom (debounced, transactional) ---------- */
+  /** Zoom: minimal & safe — debounce, re-engrave, measure via clusters, only commit if valid */
   const scheduleApplyZoom = useCallback(
     (value: number) => {
       const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
       setZoom(clamped);
       setHud((h) => ({ ...h, zoomPct: Math.round(clamped * 100) }));
 
-      if (zoomTimerRef.current) {
-        clearTimeout(zoomTimerRef.current);
-        zoomTimerRef.current = null;
+      if (zoomApplyTimerRef.current) {
+        clearTimeout(zoomApplyTimerRef.current);
+        zoomApplyTimerRef.current = null;
       }
 
-      zoomTimerRef.current = window.setTimeout(async () => {
+      zoomApplyTimerRef.current = window.setTimeout(async () => {
         const osmd = osmdRef.current;
         const outer = wrapRef.current;
         if (!osmd || !outer) return;
@@ -424,31 +443,34 @@ export default function ScoreOSMD({
         isZoomingRef.current = true;
         resizeObsRef.current?.disconnect(); // silence resize during zoom
         const mask = getMaskEl();
-        if (mask) mask.style.display = "none";
+        if (mask) mask.style.display = "none"; // avoid white overlay mid-zoom
 
+        // remember current top system by page start
         const oldStarts = pageStartsRef.current;
         const oldPage = pageIdxRef.current;
-        const oldTop = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
+        const oldTopSystem = oldStarts[Math.max(0, Math.min(oldPage, oldStarts.length - 1))] ?? 0;
 
         osmd.zoom = clamped;
         osmd.render();
 
-        // wait until systems exist at new zoom (retry a few frames)
+        // wait until bands measurable at new zoom
         let tries = 0;
         let bands: Band[] = [];
         do {
           await afterPaint();
-          bands = measureSystemsPx(outer);
+          bands = measureSystemsPxByClusters(outer);
           if (bands.length) break;
           tries++;
         } while (tries < 8);
 
         if (!bands.length) {
-          // abort safely (do not touch pagination)
+          // abort safely (keep previous pagination)
           if (mask) mask.style.display = "block";
-          // reattach a minimal observer for future resizes
           if (wrapRef.current) {
-            const ro = new ResizeObserver(() => {});
+            const ro = new ResizeObserver(() => {
+              if (isZoomingRef.current) return;
+              recomputePaginationHeightOnly();
+            });
             ro.observe(wrapRef.current);
             resizeObsRef.current = ro;
           }
@@ -458,16 +480,16 @@ export default function ScoreOSMD({
 
         bandsRef.current = bands;
 
-        const availH = getAvailH();
+        const availH = getAvailableHeight();
         if (availH >= 40) {
-          const starts = computePageStarts(bands, availH);
-          pageStartsRef.current = starts;
+          const newStarts = computePageStartIndices(bands, availH);
+          pageStartsRef.current = newStarts;
 
-          // nearest page to old top system
+          // Snap back to nearest previous system
           let nearest = 0;
           let best = Number.POSITIVE_INFINITY;
-          for (let i = 0; i < starts.length; i++) {
-            const d = Math.abs(starts[i] - oldTop);
+          for (let i = 0; i < newStarts.length; i++) {
+            const d = Math.abs(newStarts[i] - oldTopSystem);
             if (d < best) { best = d; nearest = i; }
           }
           applyPage(nearest);
@@ -475,11 +497,10 @@ export default function ScoreOSMD({
 
         if (mask) mask.style.display = "block";
 
-        // reattach resize observer
         if (wrapRef.current) {
           const ro = new ResizeObserver(() => {
             if (isZoomingRef.current) return;
-            repaginateHeightOnly();
+            recomputePaginationHeightOnly();
           });
           ro.observe(wrapRef.current);
           resizeObsRef.current = ro;
@@ -487,7 +508,7 @@ export default function ScoreOSMD({
         isZoomingRef.current = false;
       }, ZOOM_DEBOUNCE_MS);
     },
-    [applyPage, getAvailH, getMaskEl, repaginateHeightOnly]
+    [applyPage, getAvailableHeight, getMaskEl, recomputePaginationHeightOnly]
   );
 
   /* ---------- Styles ---------- */
@@ -530,7 +551,7 @@ export default function ScoreOSMD({
 
   const sliderStyle: React.CSSProperties = { flex: 1 };
 
-  // Live HUD
+  // Live HUD from refs
   const pages = pageStartsRef.current.length || 1;
   const page = Math.min(pageIdxRef.current + 1, pages);
 
