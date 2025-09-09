@@ -373,7 +373,7 @@ export default function ScoreOSMD({
         zoomApplyTimerRef.current = null;
       }
     };
-  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowAfterEngravingChange, src, zoom]);
+  }, [applyPage, getAvailableHeight, recomputePaginationHeightOnly, reflowAfterEngravingChange, src]);
 
   /** Wheel/keyboard paging */
   const goNext = useCallback(() => {
