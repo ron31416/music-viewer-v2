@@ -1,3 +1,4 @@
+// src/components/ScoreOSMD.tsx
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -16,17 +17,23 @@ type Props = {
 type Band = { top: number; bottom: number; height: number };
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
-/** Small helpers */
+/** Helpers */
 const afterPaint = () =>
-  new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+  new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
 const isPromise = (x: unknown): x is Promise<unknown> =>
   typeof x === "object" && x !== null && typeof (x as { then?: unknown }).then === "function";
 
-function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
-  return outer.querySelector("svg");
+function getSvg(el: HTMLDivElement): SVGSVGElement | null {
+  return el.querySelector("svg");
 }
-function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
-  const svg = getSvg(outer);
+
+function withUntransformedSvg<T>(host: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
+  const svg = getSvg(host);
   if (!svg) return null;
   const prev = svg.style.transform;
   svg.style.transform = "none";
@@ -37,7 +44,7 @@ function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement)
   }
 }
 
-/** Group all <g> into “systems” and measure them relative to the scroll container */
+/** Group <g> into “systems” and measure them relative to the scroll container */
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
     svgRoot.querySelectorAll<SVGGElement>(
@@ -45,21 +52,24 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
     )
   );
   const roots: Array<SVGGElement | SVGSVGElement> = pageRoots.length ? pageRoots : [svgRoot];
-  const hostTop = outer.getBoundingClientRect().top;
 
+  const hostTop = outer.getBoundingClientRect().top;
   type Box = { top: number; bottom: number; height: number; width: number };
   const boxes: Box[] = [];
+
   for (const root of roots) {
     for (const g of Array.from(root.querySelectorAll<SVGGElement>("g"))) {
       const r = g.getBoundingClientRect();
       if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-      if (r.height < 8 || r.width < 40) continue; // ignore tiny artifacts
+      if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
       boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
     }
   }
+
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px between systems
+  // Merge consecutive boxes into systems if they are close vertically.
+  const GAP = 18; // px between system groups
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -78,18 +88,11 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
 function computePageStarts(bands: Band[], viewportH: number): number[] {
   if (!bands.length || viewportH <= 0) return [0];
   const starts: number[] = [];
-  let i = 0;
-  while (i < bands.length) {
-    // start page at system i
+  for (let i = 0; i < bands.length; ) {
     const startTop = bands[i].top;
     let last = i;
     // greedily add systems while they still fully fit
-    while (
-      last + 1 < bands.length &&
-      bands[last + 1].bottom - startTop <= viewportH
-    ) {
-      last += 1;
-    }
+    while (last + 1 < bands.length && bands[last + 1].bottom - startTop <= viewportH) last++;
     starts.push(startTop);
     // next page begins at next system after the last that fully fit
     i = last + 1;
@@ -104,20 +107,19 @@ export default function ScoreOSMD({
   className = "",
   style,
 }: Props) {
-  const wrapRef = useRef<HTMLDivElement | null>(null);       // scroll container
-  const osmdHostRef = useRef<HTMLDivElement | null>(null);   // OSMD mount
+  const outerRef = useRef<HTMLDivElement | null>(null);   // positioned wrapper
+  const scrollRef = useRef<HTMLDivElement | null>(null);  // scrolling element (OSMD host)
   const osmdRef = useRef<OSMDWithLifecycle | null>(null);
 
   // model
   const bandsRef = useRef<Band[]>([]);
-  const [pageStarts, setPageStarts] = useState<number[]>([0]); // absolute Y tops (px) inside scroll port
+  const [pageStarts, setPageStarts] = useState<number[]>([0]);
   const [hud, setHud] = useState({ page: 1, pages: 1 });
 
   const updateHUDFromScroll = useCallback(() => {
-    const el = wrapRef.current;
+    const el = scrollRef.current;
     if (!el || !pageStarts.length) return;
     const y = el.scrollTop;
-    // page index = last start <= scrollTop
     let p = 0;
     for (let i = 0; i < pageStarts.length; i++) {
       if (pageStarts[i] <= y + 1) p = i;
@@ -127,90 +129,107 @@ export default function ScoreOSMD({
   }, [pageStarts]);
 
   // Scroll to nearest (or specific) page start
-  const scrollToPageIdx = useCallback((idx: number, behavior: ScrollBehavior = "auto") => {
-    const el = wrapRef.current;
-    if (!el || !pageStarts.length) return;
-    const clamped = Math.max(0, Math.min(idx, pageStarts.length - 1));
-    el.scrollTo({ top: pageStarts[clamped], left: 0, behavior });
-  }, [pageStarts]);
+  const scrollToPageIdx = useCallback(
+    (idx: number, behavior: ScrollBehavior = "auto") => {
+      const el = scrollRef.current;
+      if (!el || !pageStarts.length) return;
+      const clamped = Math.max(0, Math.min(idx, pageStarts.length - 1));
+      el.scrollTo({ top: pageStarts[clamped], left: 0, behavior });
+    },
+    [pageStarts]
+  );
 
-  const nextPage = useCallback((delta: number) => {
-    const el = wrapRef.current;
-    if (!el || !pageStarts.length) return;
-    // find current page
-    let cur = 0;
-    const y = el.scrollTop;
-    for (let i = 0; i < pageStarts.length; i++) {
-      if (pageStarts[i] <= y + 1) cur = i;
-      else break;
-    }
-    scrollToPageIdx(cur + delta, "smooth");
-  }, [pageStarts, scrollToPageIdx]);
+  const nextPage = useCallback(
+    (delta: number) => {
+      const el = scrollRef.current;
+      if (!el || !pageStarts.length) return;
+      const y = el.scrollTop;
+      let cur = 0;
+      for (let i = 0; i < pageStarts.length; i++) {
+        if (pageStarts[i] <= y + 1) cur = i;
+        else break;
+      }
+      scrollToPageIdx(cur + delta, "smooth");
+    },
+    [pageStarts, scrollToPageIdx]
+  );
 
-  // Build snap markers from pageStarts
-  const snapMarkers = useMemo(() => {
-    return pageStarts.map((top, i) => (
-      <div
-        key={`snap-${i}`}
-        style={{
-          position: "absolute",
-          top,
-          left: 0,
-          width: 1,
-          height: 1,
-          scrollSnapAlign: "start",
-          scrollSnapStop: "always",
-          pointerEvents: "none",
-        }}
-      />
-    ));
-  }, [pageStarts]);
+  // Snap markers MUST be children of the scrolling element
+  const snapMarkers = useMemo(
+    () =>
+      pageStarts.map((top, i) => (
+        <div
+          key={`snap-${i}`}
+          style={{
+            position: "absolute",
+            top,
+            left: 0,
+            width: 1,
+            height: 1,
+            scrollSnapAlign: "start",
+            scrollSnapStop: "always",
+            pointerEvents: "none",
+          }}
+        />
+      )),
+    [pageStarts]
+  );
 
   // Recompute bands + page starts (no transforms, native scroll)
   const recomputeLayout = useCallback(() => {
-    const outer = wrapRef.current;
-    if (!outer) return;
-    const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
+    const sc = scrollRef.current;
+    if (!sc) return;
+
+    const bands = withUntransformedSvg(sc, (svg) => measureSystemsPx(sc, svg)) ?? [];
     bandsRef.current = bands;
 
-    const starts = computePageStarts(bands, outer.clientHeight);
+    const starts = computePageStarts(bands, sc.clientHeight);
     setPageStarts(starts);
 
-    // keep user position by snapping to nearest start
-    const y = outer.scrollTop;
+    // keep user position by snapping to nearest start to avoid partial lines
+    const y = sc.scrollTop;
     let nearest = 0;
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < starts.length; i++) {
       const d = Math.abs(starts[i] - y);
-      if (d < best) { best = d; nearest = i; }
+      if (d < best) {
+        best = d;
+        nearest = i;
+      }
     }
-    // jump (no animation) to exact snap to avoid partial lines after resize
     scrollToPageIdx(nearest, "auto");
-    // HUD
     setHud({ page: nearest + 1, pages: starts.length });
   }, [scrollToPageIdx]);
 
-  // Wheel/keys just delegate to native scroll + snapping
+  // Keyboard navigation (wheel/trackpad uses native scroll + snap)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!wrapRef.current) return;
-      if (["PageDown", "ArrowDown", " "].includes(e.key)) { e.preventDefault(); nextPage(1); }
-      else if (["PageUp", "ArrowUp"].includes(e.key)) { e.preventDefault(); nextPage(-1); }
-      else if (e.key === "Home") { e.preventDefault(); scrollToPageIdx(0, "smooth"); }
-      else if (e.key === "End") { e.preventDefault(); scrollToPageIdx(pageStarts.length - 1, "smooth"); }
+      if (!scrollRef.current) return;
+      if (["PageDown", "ArrowDown", " "].includes(e.key)) {
+        e.preventDefault();
+        nextPage(1);
+      } else if (["PageUp", "ArrowUp"].includes(e.key)) {
+        e.preventDefault();
+        nextPage(-1);
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        scrollToPageIdx(0, "smooth");
+      } else if (e.key === "End") {
+        e.preventDefault();
+        scrollToPageIdx(pageStarts.length - 1, "smooth");
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [nextPage, scrollToPageIdx, pageStarts.length]);
 
-  // Mount + OSMD init (we own resize; OSMD autoResize off)
+  // Mount + OSMD init (autoResize: false; we re-render on container resizes)
   useEffect(() => {
     let resizeObs: ResizeObserver | null = null;
 
     (async () => {
-      const host = osmdHostRef.current;
-      const wrapper = wrapRef.current;
-      if (!host || !wrapper) return;
+      const sc = scrollRef.current;
+      if (!sc) return;
       await afterPaint();
 
       const { OpenSheetMusicDisplay } =
@@ -221,9 +240,9 @@ export default function ScoreOSMD({
         osmdRef.current.dispose?.();
       }
 
-      const osmd = new OpenSheetMusicDisplay(host, {
+      const osmd = new OpenSheetMusicDisplay(sc, {
         backend: "svg" as const,
-        autoResize: false,            // we’ll handle it
+        autoResize: false, // we’ll handle it explicitly
         drawTitle: true,
         drawSubtitle: true,
         drawComposer: true,
@@ -236,36 +255,37 @@ export default function ScoreOSMD({
       osmd.render();
       await afterPaint();
 
-      // first layout + page starts
+      // Ensure the SVG can't force horizontal scroll jank / black backgrounds
+      sc.style.background = "#fff";
+      sc.style.minWidth = "0";
+      sc.style.overflowX = "hidden";
+
       recomputeLayout();
 
-      // Observe container size and recompute (debounced by RAF)
+      // Observe size changes on the scrolling element itself
       let raf = 0;
       resizeObs = new ResizeObserver(() => {
         if (raf) cancelAnimationFrame(raf);
         raf = requestAnimationFrame(() => {
-          osmd.render(); // let OSMD layout to the new width
+          osmd.render();
           afterPaint().then(recomputeLayout);
         });
       });
-      resizeObs.observe(wrapper);
+      resizeObs.observe(sc);
 
-      // Update HUD on scroll end (native snapping will do the alignment)
+      // HUD on scroll (snap will align sections for us)
       const onScroll = () => {
-        // throttle via RAF
         if (raf) cancelAnimationFrame(raf);
-        raf = requestAnimationFrame(() => updateHUDFromScroll());
+        raf = requestAnimationFrame(updateHUDFromScroll);
       };
-      wrapper.addEventListener("scroll", onScroll, { passive: true });
+      sc.addEventListener("scroll", onScroll, { passive: true });
 
-      return () => {
-        wrapper.removeEventListener("scroll", onScroll);
-      };
+      return () => sc.removeEventListener("scroll", onScroll);
     })().catch(() => {});
 
     return () => {
-      const w = wrapRef.current;
-      if (resizeObs && w) resizeObs.unobserve(w);
+      const sc = scrollRef.current;
+      if (resizeObs && sc) resizeObs.unobserve(sc);
       if (osmdRef.current) {
         osmdRef.current.clear?.();
         osmdRef.current.dispose?.();
@@ -274,7 +294,7 @@ export default function ScoreOSMD({
     };
   }, [recomputeLayout, updateHUDFromScroll, src]);
 
-  /** Styles */
+  /** Layout styles */
   const outerStyle: React.CSSProperties = fillParent
     ? { width: "100%", height: "100%", minHeight: 0, position: "relative", overflow: "hidden" }
     : { width: "100%", height: height ?? 600, minHeight: height ?? 600, position: "relative", overflow: "hidden" };
@@ -287,6 +307,8 @@ export default function ScoreOSMD({
     // snap container
     scrollSnapType: "y mandatory",
     WebkitOverflowScrolling: "touch",
+    background: "#fff",
+    minWidth: 0,
   };
 
   const btn: React.CSSProperties = {
@@ -299,25 +321,23 @@ export default function ScoreOSMD({
   };
 
   return (
-    <div ref={wrapRef} className={className} style={{ ...outerStyle, ...style }}>
-      {/* OSMD layer */}
-      <div ref={osmdHostRef} style={scrollStyle} />
-
-      {/* Snap markers overlay (must be scroll children of the same container) */}
-      <div
-        style={{
-          position: "absolute",
-          inset: 0,
-          pointerEvents: "none",
-        }}
-      >
-        {snapMarkers}
+    <div ref={outerRef} className={className} style={{ ...outerStyle, ...style }}>
+      {/* SCROLLING ELEMENT = OSMD HOST (SVG inserted here) */}
+      <div ref={scrollRef} style={scrollStyle}>
+        {/* Snap markers MUST be children of the scrolling element */}
+        <div style={{ position: "relative", width: "100%", height: 0, pointerEvents: "none" }}>
+          {snapMarkers}
+        </div>
       </div>
 
       {/* Controls */}
       <div style={{ position: "absolute", right: 10, top: 10, display: "flex", gap: 8, zIndex: 10 }}>
-        <button type="button" style={btn} onClick={() => nextPage(-1)}>Prev</button>
-        <button type="button" style={btn} onClick={() => nextPage(1)}>Next</button>
+        <button type="button" style={btn} onClick={() => nextPage(-1)}>
+          Prev
+        </button>
+        <button type="button" style={btn} onClick={() => nextPage(1)}>
+          Next
+        </button>
       </div>
 
       {/* HUD */}
