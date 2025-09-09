@@ -4,21 +4,21 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
-/* ───────────── Types & small helpers ───────────── */
+/* Props & types */
 type Props = {
   src: string;
   fillParent?: boolean;
   height?: number;
-  debug?: boolean;
+  debug?: boolean;         // kept for future, not logging to avoid lint
   allowScroll?: boolean;
   className?: string;
   style?: React.CSSProperties;
 };
 
 type Band = { top: number; bottom: number; height: number };
-
 type OSMDWithLifecycle = OpenSheetMusicDisplay & { clear?: () => void; dispose?: () => void };
 
+/* Small helpers */
 function isPromise<T = unknown>(x: unknown): x is Promise<T> {
   return typeof x === "object" && x !== null && "then" in (x as { then?: unknown });
 }
@@ -38,14 +38,11 @@ function purgeWebGL(node: HTMLElement): void {
   }
 }
 
+/* Measure OSMD systems (SVG <g> clusters) in px relative to wrapper */
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg") as SVGSVGElement | null;
 }
-
-function withUntransformedSvg<T>(
-  outer: HTMLDivElement,
-  fn: (svg: SVGSVGElement) => T
-): T | null {
+function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement) => T): T | null {
   const svg = getSvg(outer);
   if (!svg) return null;
   const prev = svg.style.transform;
@@ -56,7 +53,6 @@ function withUntransformedSvg<T>(
     svg.style.transform = prev;
   }
 }
-
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
     svgRoot.querySelectorAll<SVGGElement>(
@@ -74,7 +70,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
       try {
         const r = g.getBoundingClientRect();
         if (!Number.isFinite(r.top) || !Number.isFinite(r.height) || !Number.isFinite(r.width)) continue;
-        if (r.height < 8 || r.width < 40) continue;
+        if (r.height < 8 || r.width < 40) continue; // ignore tiny fragments
         boxes.push({ top: r.top - hostTop, bottom: r.bottom - hostTop, height: r.height, width: r.width });
       } catch {}
     }
@@ -82,7 +78,7 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
 
   boxes.sort((a, b) => a.top - b.top);
 
-  const GAP = 18; // px gap between consecutive elements to consider a new system
+  const GAP = 18; // px between system groups
   const bands: Band[] = [];
   for (const b of boxes) {
     const last = bands[bands.length - 1];
@@ -97,12 +93,12 @@ function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[]
   return bands;
 }
 
-/* ───────────── Component ───────────── */
+/* Component */
 export default function ScoreOSMD({
   src,
   fillParent = false,
   height = 600,
-  debug = false,
+  debug = false,           // not used to avoid no-console lint
   allowScroll = false,
   className = "",
   style,
@@ -116,7 +112,7 @@ export default function ScoreOSMD({
   const bandsRef = useRef<Band[]>([]);
   const perPageRef = useRef<number>(1);
   const pageRef = useRef<number>(0);
-  const currentStartIdxRef = useRef<number>(0); // ★ first visible system index
+  const currentStartIdxRef = useRef<number>(0); // first visible system index
   const readyRef = useRef<boolean>(false);
 
   // UI
@@ -127,19 +123,6 @@ export default function ScoreOSMD({
   const MASK_OVERLAP = 4;          // px: hide slightly above next system top
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
-
-  // Debounced recompute (wait for OSMD auto-resize to settle)
-  const raf1 = useRef<number | null>(null);
-  const raf2 = useRef<number | null>(null);
-  const scheduleRecompute = useCallback(() => {
-    if (raf1.current != null) cancelAnimationFrame(raf1.current);
-    if (raf2.current != null) cancelAnimationFrame(raf2.current);
-    raf1.current = requestAnimationFrame(() => {
-      raf2.current = requestAnimationFrame(() => {
-        recomputeLayoutAndPage(true); // keep logical position
-      });
-    });
-  }, []);
 
   const updateHUD = useCallback(() => {
     const total = bandsRef.current.length;
@@ -163,38 +146,30 @@ export default function ScoreOSMD({
     pageRef.current = pageIdx;
 
     const startIdx = pageIdx * perPage;
-    currentStartIdxRef.current = startIdx; // ★ persist logical position
+    currentStartIdxRef.current = startIdx; // persist logical position
 
     const startTop = bands[startIdx]?.top ?? 0;
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
     const nextIdx = lastIdx + 1;
 
-    // Align first visible system exactly to the viewport top (ceil avoids top gaps)
+    // Align first visible system exactly to the viewport top
     const ySnap = Math.ceil(startTop);
     svg.style.transform = `translateY(${-ySnap}px)`;
     svg.style.willChange = "transform";
 
-    // Bottom mask hides anything starting from the NEXT system’s top (with overlap)
+    // Bottom mask: hide from NEXT system’s top (with tiny overlap)
     let maskTop = outer.clientHeight;
     if (nextIdx < bands.length) {
       const nextTopRel = bands[nextIdx].top - startTop;
-      maskTop = Math.min(
-        outer.clientHeight - 1,
-        Math.max(0, Math.ceil(nextTopRel - MASK_OVERLAP))
-      );
+      maskTop = Math.min(outer.clientHeight - 1, Math.max(0, Math.ceil(nextTopRel - MASK_OVERLAP)));
     }
     if (maskRef.current) {
       maskRef.current.style.top = `${maskTop}px`;
       maskRef.current.style.display = "block";
     }
 
-    if (debug) {
-      // eslint-disable-next-line no-console
-      console.log({ pageIdx, perPage, startIdx, lastIdx, nextIdx, startTop, ySnap, maskTop });
-    }
-
     updateHUD();
-  }, [MASK_OVERLAP, updateHUD, debug]);
+  }, [MASK_OVERLAP, updateHUD]);
 
   const recomputeLayoutAndPage = useCallback((keepPosition = false) => {
     const outer = wrapRef.current;
@@ -203,7 +178,7 @@ export default function ScoreOSMD({
     const bands = withUntransformedSvg(outer, (svg) => measureSystemsPx(outer, svg)) ?? [];
     bandsRef.current = bands;
 
-    // recompute how many systems fit vertically; we rely on the mask for peeking
+    // how many systems fit vertically; we rely on the mask to hide the next one
     const limit = outer.clientHeight;
     let n = 0;
     for (const b of bands) {
@@ -212,38 +187,29 @@ export default function ScoreOSMD({
     }
     perPageRef.current = Math.max(1, n);
 
-    // ★ Keep the same logical start index if asked
     if (keepPosition) {
-      let startIdx = Math.min(
-        Math.max(0, currentStartIdxRef.current),
-        Math.max(0, bands.length - 1)
-      );
+      const startIdx = Math.min(Math.max(0, currentStartIdxRef.current), Math.max(0, bands.length - 1)); // ← const to satisfy lint
       const perPage = Math.max(1, perPageRef.current);
-      pageRef.current = Math.min(
-        Math.floor(startIdx / perPage),
-        Math.max(0, Math.ceil(bands.length / perPage) - 1)
-      );
+      pageRef.current = Math.min(Math.floor(startIdx / perPage), Math.max(0, Math.ceil(bands.length / perPage) - 1));
     } else {
-      // default to page 0 on initial load
       pageRef.current = Math.min(pageRef.current, Math.max(0, Math.ceil(bands.length / perPageRef.current) - 1));
     }
 
-    if (debug) {
-      // eslint-disable-next-line no-console
-      console.table(
-        bands.map((b, i) => ({
-          line: i + 1,
-          top: b.top.toFixed(1),
-          bottom: b.bottom.toFixed(1),
-          height: b.height.toFixed(1),
-        }))
-      );
-      // eslint-disable-next-line no-console
-      console.log(`linesPerPage=${perPageRef.current}, totalSystems=${bands.length}, page=${pageRef.current + 1}, keep=${keepPosition}`);
-    }
-
     applyTranslateForPage(pageRef.current);
-  }, [applyTranslateForPage, debug]);
+  }, [applyTranslateForPage]);
+
+  // Debounced recompute (wait for OSMD auto-resize to settle) — include recomputeLayoutAndPage in deps
+  const raf1 = useRef<number | null>(null);
+  const raf2 = useRef<number | null>(null);
+  const scheduleRecompute = useCallback(() => {
+    if (raf1.current != null) cancelAnimationFrame(raf1.current);
+    if (raf2.current != null) cancelAnimationFrame(raf2.current);
+    raf1.current = requestAnimationFrame(() => {
+      raf2.current = requestAnimationFrame(() => {
+        recomputeLayoutAndPage(true);
+      });
+    });
+  }, [recomputeLayoutAndPage]);
 
   const nextPage = useCallback((deltaPages: number) => {
     if (!readyRef.current) return;
@@ -343,21 +309,18 @@ export default function ScoreOSMD({
         maskRef.current = mask;
       }
 
-      currentStartIdxRef.current = 0; // start at first system
+      currentStartIdxRef.current = 0;
       pageRef.current = 0;
       recomputeLayoutAndPage(false);
       readyRef.current = true;
 
-      // Debounced resize observing the wrapper (OSMD auto-resizes into it)
+      // Debounced resize observing the wrapper
       localResizeObs = new ResizeObserver(() => {
-        scheduleRecompute(); // keepPosition=true
+        scheduleRecompute(); // keepPosition = true
       });
       localResizeObs.observe(wrapper);
       resizeObsRef.current = localResizeObs;
-    })().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("OSMD init error:", err);
-    });
+    })().catch(() => {});
 
     return () => {
       if (localResizeObs && wrapRef.current) localResizeObs.unobserve(wrapRef.current);
