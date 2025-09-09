@@ -37,7 +37,10 @@ export default function ScoreOSMD({
   const [pages, setPages] = useState<Page[]>([]);
   const [pageIndex, setPageIndex] = useState(0);
 
-  /** Compute pages from system heights, reserving space for footer bar so no partial system shows. */
+  /**
+   * Compute pages from system heights, reserving footer space and bleed margin
+   * so the next line never shows.
+   */
   const computePages = useCallback((): Page[] => {
     const svgRoot = containerRef.current?.querySelector("svg");
     if (!svgRoot) return [];
@@ -45,16 +48,17 @@ export default function ScoreOSMD({
     const systems = Array.from(svgRoot.querySelectorAll<SVGGElement>("g.system"));
     if (!systems.length) return [];
 
-    // Reserve pixels for footer if visible
-    const footerPx = showControls ? 36 : 0;
+    // Reserve space for footer (solid bar) and extra bleed margin
+    const footerPx = showControls ? 44 : 0;
+    const bleedPx = 8; // extra margin to prevent slur/beam peeking
 
-    // Determine available height:
-    // 1) explicit override, else 2) measured clientHeight, else 3) window height fallback.
+    // Figure available height:
     const measured = viewportRef.current?.clientHeight ?? 0;
-    const fallback = Math.max(1, (typeof window !== "undefined" ? window.innerHeight : 900) - footerPx);
-    const rawVh = viewportHeightPx ?? (measured > 0 ? measured : fallback);
-
-    const vh = Math.max(1, rawVh - footerPx); // subtract footer space
+    // If no measurement yet, fall back to window height
+    const parentOrWindow =
+      viewportHeightPx ??
+      (measured > 0 ? measured : (typeof window !== "undefined" ? window.innerHeight : 900));
+    const usable = Math.max(1, parentOrWindow - footerPx - bleedPx);
 
     const heights = systems.map((g) => g.getBBox().height);
 
@@ -65,16 +69,16 @@ export default function ScoreOSMD({
     for (let i = 0; i < heights.length; i++) {
       const h = heights[i];
 
-      // If adding this system would overflow, close the page before it.
-      if (acc > 0 && acc + h > vh) {
+      // If adding this system would overflow the usable height, close the page
+      if (acc > 0 && acc + h > usable) {
         next.push({ start, end: i - 1 });
         start = i;
         acc = 0;
       }
       acc += h;
 
-      // If a single system is taller than the viewport, it becomes a solo page.
-      if (h > vh) {
+      // Very tall single system → its own page
+      if (h > usable) {
         if (acc !== h) next.push({ start, end: i - 1 });
         next.push({ start: i, end: i });
         start = i + 1;
@@ -86,7 +90,7 @@ export default function ScoreOSMD({
     return next;
   }, [viewportHeightPx, showControls]);
 
-  /** Show only the systems in the current page (mask others). */
+  /** Mask: show only systems in current page. */
   const applyPageVisibility = useCallback((page: Page | null) => {
     const svgRoot = containerRef.current?.querySelector("svg");
     if (!svgRoot) return;
@@ -103,7 +107,7 @@ export default function ScoreOSMD({
     });
   }, []);
 
-  /** Initialize OSMD; compute pages after render + next frame (ensures SVG is measurable). */
+  /** Initialize OSMD; compute pages after render + next frame (so BBoxes are measurable). */
   useEffect(() => {
     let cancelled = false;
 
@@ -121,11 +125,10 @@ export default function ScoreOSMD({
 
       try {
         await osmd.load(src);
-        // Keep default Zoom (1.0). Zoom UI intentionally removed in this build.
+        // Keep default zoom. No zoom UI in this build.
         osmd.render();
         if (cancelled) return;
 
-        // Defer to next frame so clientHeight and SVG BBoxes are ready
         requestAnimationFrame(() => {
           const nextPages = computePages();
           setPages(nextPages);
@@ -143,14 +146,14 @@ export default function ScoreOSMD({
     };
   }, [src, computePages]);
 
-  /** Re-apply masking when pages or index changes. */
+  /** Apply masking whenever page changes. */
   useLayoutEffect(() => {
     if (!pages.length) return;
     const clamped = Math.max(0, Math.min(pageIndex, pages.length - 1));
     applyPageVisibility(pages[clamped] ?? null);
   }, [pages, pageIndex, applyPageVisibility]);
 
-  /** Re-paginate on window resize (render synchronously, measure on next frame). */
+  /** Re-paginate on resize (render sync, measure next frame). */
   useEffect(() => {
     const onResize = () => {
       if (!osmdRef.current) return;
@@ -202,7 +205,7 @@ export default function ScoreOSMD({
         style={{
           position: "relative",
           overflow: "hidden",
-          // Fill parent by default for parity with your app layout
+          // Fill parent by default
           height: viewportHeightPx ? `${viewportHeightPx}px` : "100%",
           width: "100%",
           background: "white",
@@ -226,7 +229,7 @@ export default function ScoreOSMD({
           </div>
         )}
 
-        {/* Bottom status bar (kept minimal; no zoom, no prev/next) */}
+        {/* Bottom status bar (SOLID background; no transparency) */}
         {showControls && (
           <div
             style={{
@@ -238,8 +241,8 @@ export default function ScoreOSMD({
               justifyContent: "center",
               alignItems: "center",
               gap: 12,
-              padding: "6px 10px",
-              background: "rgba(255,255,255,0.9)",
+              padding: "8px 10px",
+              background: "#fff",           // solid white, nothing shows through
               borderTop: "1px solid #ddd",
               fontSize: 13,
             }}
