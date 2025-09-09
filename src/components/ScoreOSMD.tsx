@@ -9,7 +9,7 @@ type Props = {
   src: string;
   fillParent?: boolean;
   height?: number;
-  debug?: boolean;         // kept for future, not logging to avoid lint
+  debug?: boolean;
   allowScroll?: boolean;
   className?: string;
   style?: React.CSSProperties;
@@ -37,8 +37,6 @@ function purgeWebGL(node: HTMLElement): void {
     } catch {}
   }
 }
-
-/* Measure OSMD systems (SVG <g> clusters) in px relative to wrapper */
 function getSvg(outer: HTMLDivElement): SVGSVGElement | null {
   return outer.querySelector("svg") as SVGSVGElement | null;
 }
@@ -53,6 +51,8 @@ function withUntransformedSvg<T>(outer: HTMLDivElement, fn: (svg: SVGSVGElement)
     svg.style.transform = prev;
   }
 }
+
+/* Measure OSMD systems (SVG <g> clusters) in px relative to wrapper */
 function measureSystemsPx(outer: HTMLDivElement, svgRoot: SVGSVGElement): Band[] {
   const pageRoots = Array.from(
     svgRoot.querySelectorAll<SVGGElement>(
@@ -98,7 +98,7 @@ export default function ScoreOSMD({
   src,
   fillParent = false,
   height = 600,
-  debug = false,           // not used to avoid no-console lint
+  debug = false, // retained for future toggles
   allowScroll = false,
   className = "",
   style,
@@ -124,6 +124,38 @@ export default function ScoreOSMD({
   const WHEEL_THROTTLE_MS = 140;
   const wheelLockRef = useRef<number>(0);
 
+  /* ---------- Stabilizer: wait until wrapper+SVG sizes stop changing ---------- */
+  const reflowTokenRef = useRef<number>(0);
+  const waitForStableLayout = useCallback(async (outer: HTMLDivElement) => {
+    const svg = getSvg(outer);
+    if (!svg) return;
+
+    // Track sizes; require N consecutive stable frames
+    const NEED_STABLE = 3;
+    let stableCount = 0;
+    let prev = { w: -1, h: -1, cw: -1, ch: -1 };
+
+    const start = performance.now();
+    const TIMEOUT_MS = 250; // hard cap
+
+    while (stableCount < NEED_STABLE && performance.now() - start < TIMEOUT_MS) {
+      await new Promise((r) => requestAnimationFrame(r));
+      const br = svg.getBoundingClientRect();
+      const now = {
+        w: Math.round(br.width),
+        h: Math.round(br.height),
+        cw: outer.clientWidth,
+        ch: outer.clientHeight,
+      };
+      if (now.w === prev.w && now.h === prev.h && now.cw === prev.cw && now.ch === prev.ch) {
+        stableCount += 1;
+      } else {
+        stableCount = 0;
+        prev = now;
+      }
+    }
+  }, []);
+
   const updateHUD = useCallback(() => {
     const total = bandsRef.current.length;
     const perPage = Math.max(1, perPageRef.current);
@@ -146,7 +178,7 @@ export default function ScoreOSMD({
     pageRef.current = pageIdx;
 
     const startIdx = pageIdx * perPage;
-    currentStartIdxRef.current = startIdx; // persist logical position
+    currentStartIdxRef.current = startIdx; // lock logical position
 
     const startTop = bands[startIdx]?.top ?? 0;
     const lastIdx = Math.min(startIdx + perPage - 1, total - 1);
@@ -188,7 +220,7 @@ export default function ScoreOSMD({
     perPageRef.current = Math.max(1, n);
 
     if (keepPosition) {
-      const startIdx = Math.min(Math.max(0, currentStartIdxRef.current), Math.max(0, bands.length - 1)); // ← const to satisfy lint
+      const startIdx = Math.min(Math.max(0, currentStartIdxRef.current), Math.max(0, bands.length - 1));
       const perPage = Math.max(1, perPageRef.current);
       pageRef.current = Math.min(Math.floor(startIdx / perPage), Math.max(0, Math.ceil(bands.length / perPage) - 1));
     } else {
@@ -198,18 +230,21 @@ export default function ScoreOSMD({
     applyTranslateForPage(pageRef.current);
   }, [applyTranslateForPage]);
 
-  // Debounced recompute (wait for OSMD auto-resize to settle) — include recomputeLayoutAndPage in deps
-  const raf1 = useRef<number | null>(null);
-  const raf2 = useRef<number | null>(null);
+  /* Debounced + stabilized recompute (wait for OSMD auto-resize to truly settle) */
   const scheduleRecompute = useCallback(() => {
-    if (raf1.current != null) cancelAnimationFrame(raf1.current);
-    if (raf2.current != null) cancelAnimationFrame(raf2.current);
-    raf1.current = requestAnimationFrame(() => {
-      raf2.current = requestAnimationFrame(() => {
-        recomputeLayoutAndPage(true);
-      });
+    const outer = wrapRef.current;
+    if (!outer) return;
+
+    const myToken = ++reflowTokenRef.current;
+
+    // micro-debounce with 1 RAF + stability wait
+    requestAnimationFrame(async () => {
+      if (myToken !== reflowTokenRef.current) return;
+      await waitForStableLayout(outer);
+      if (myToken !== reflowTokenRef.current) return;
+      recomputeLayoutAndPage(true); // keep logical position
     });
-  }, [recomputeLayoutAndPage]);
+  }, [recomputeLayoutAndPage, waitForStableLayout]);
 
   const nextPage = useCallback((deltaPages: number) => {
     if (!readyRef.current) return;
@@ -314,7 +349,7 @@ export default function ScoreOSMD({
       recomputeLayoutAndPage(false);
       readyRef.current = true;
 
-      // Debounced resize observing the wrapper
+      // Debounced + stabilized resize observing the wrapper
       localResizeObs = new ResizeObserver(() => {
         scheduleRecompute(); // keepPosition = true
       });
@@ -330,8 +365,6 @@ export default function ScoreOSMD({
         osmdRef.current.dispose?.();
         osmdRef.current = null;
       }
-      if (raf1.current != null) cancelAnimationFrame(raf1.current);
-      if (raf2.current != null) cancelAnimationFrame(raf2.current);
     };
   }, [src, recomputeLayoutAndPage, scheduleRecompute]);
 
