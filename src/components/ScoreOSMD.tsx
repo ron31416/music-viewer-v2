@@ -21,9 +21,13 @@ type ScoreOSMDProps = {
 
 type Page = { start: number; end: number };
 
-function debounce<F extends (...args: any[]) => void>(fn: F, ms: number) {
+/** Debounce without `any` */
+function debounce<Args extends unknown[]>(
+  fn: (...args: Args) => void,
+  ms: number
+) {
   let t: ReturnType<typeof setTimeout> | null = null;
-  return (...args: Parameters<F>) => {
+  return (...args: Args) => {
     if (t) clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
@@ -146,7 +150,7 @@ export default function ScoreOSMD({
 
       try {
         await osmd.load(src);
-        osmd.Zoom = zoom;              // <-- set via property, not setOptions
+        osmd.Zoom = zoom;              // set via property, not setOptions
         await osmd.render();
         if (cancelled) return;
 
@@ -188,7 +192,7 @@ export default function ScoreOSMD({
       if (!osmdRef.current) return;
 
       withRenderQueue(async () => {
-        osmdRef.current!.Zoom = clamped;   // <-- property setter
+        osmdRef.current!.Zoom = clamped;
         await osmdRef.current!.render();
 
         const nextPages = computePages();
@@ -218,7 +222,7 @@ export default function ScoreOSMD({
               max={300}
               step={5}
               value={Math.round(zoom * 100)}
-              onChange={(e) => {
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                 const value = Number(e.target.value) / 100;
                 debouncedApplyZoom(value, { keepPage: true });
               }}
